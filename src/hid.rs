@@ -22,7 +22,7 @@ mod platform {
     const VENDOR_ID: u16 = 0x303A;
     const PRODUCT_ID: u16 = 0x8360;
     const USAGE_PAGE: u16 = 0xFF00;
-    const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+    const RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
     const LOCK_TIMEOUT: Duration = Duration::from_secs(20);
 
     #[derive(Debug, Error)]
@@ -47,6 +47,12 @@ mod platform {
         LockIo(#[source] io::Error),
         #[error("timed out waiting for another Codex Micro LED writer")]
         LockTimeout,
+        #[error("Codex Micro connection failed ({initial}); reconnect attempt failed: {retry}")]
+        Reconnect {
+            initial: String,
+            #[source]
+            retry: Box<DeviceError>,
+        },
         #[error(transparent)]
         Protocol(#[from] crate::protocol::ProtocolError),
     }
@@ -54,6 +60,81 @@ mod platform {
     pub struct DeviceSummary {
         pub product: Option<String>,
         pub serial: Option<String>,
+    }
+
+    pub struct Controller {
+        _lock: HidWriteLock,
+        _api: HidApi,
+        device: HidDevice,
+    }
+
+    impl Controller {
+        pub fn open() -> Result<Self, DeviceError> {
+            let lock = HidWriteLock::acquire(LOCK_TIMEOUT)?;
+            let (api, device, _summary) = open_device()?;
+            Ok(Self {
+                _lock: lock,
+                _api: api,
+                device,
+            })
+        }
+
+        pub fn set_ambient(
+            &mut self,
+            id: u16,
+            effect: LightingEffect,
+            packed_rgb: u32,
+            brightness: f32,
+            speed: f32,
+            magic: f32,
+        ) -> Result<(), DeviceError> {
+            let request = ambient_effect_request(id, effect, packed_rgb, brightness, speed, magic)?;
+            self.send_with_reconnect(id, &request)
+        }
+
+        pub fn clear(&mut self, id: u16) -> Result<(), DeviceError> {
+            self.send_with_reconnect(id, &off_request(id))
+        }
+
+        fn send_with_reconnect(
+            &mut self,
+            id: u16,
+            request: &RpcRequest,
+        ) -> Result<(), DeviceError> {
+            match send_request(&self.device, id, request) {
+                Ok(()) => Ok(()),
+                Err(error) if error.is_transport_failure() => {
+                    let initial = error.to_string();
+                    self.reopen()
+                        .and_then(|()| send_request(&self.device, id, request))
+                        .map_err(|retry| DeviceError::Reconnect {
+                            initial,
+                            retry: Box::new(retry),
+                        })
+                }
+                Err(error) => Err(error),
+            }
+        }
+
+        fn reopen(&mut self) -> Result<(), DeviceError> {
+            let (api, device, _summary) = open_device()?;
+            self.device = device;
+            self._api = api;
+            Ok(())
+        }
+    }
+
+    impl DeviceError {
+        fn is_transport_failure(&self) -> bool {
+            matches!(
+                self,
+                Self::Open(_)
+                    | Self::Write(_)
+                    | Self::ShortWrite { .. }
+                    | Self::Read(_)
+                    | Self::ResponseTimeout
+            )
+        }
     }
 
     struct HidWriteLock {
@@ -139,17 +220,14 @@ mod platform {
         speed: f32,
         magic: f32,
     ) -> Result<(), DeviceError> {
-        let request = ambient_effect_request(id, effect, packed_rgb, brightness, speed, magic)?;
-        send_request(id, &request)
+        Controller::open()?.set_ambient(id, effect, packed_rgb, brightness, speed, magic)
     }
 
     pub fn clear(id: u16) -> Result<(), DeviceError> {
-        send_request(id, &off_request(id))
+        Controller::open()?.clear(id)
     }
 
-    fn send_request(id: u16, request: &RpcRequest) -> Result<(), DeviceError> {
-        let _lock = HidWriteLock::acquire(LOCK_TIMEOUT)?;
-        let (_api, device, _summary) = open_device()?;
+    fn send_request(device: &HidDevice, id: u16, request: &RpcRequest) -> Result<(), DeviceError> {
         for report in frame_rpc_request(request)? {
             let written = device.write(&report).map_err(DeviceError::Write)?;
             if written != REPORT_SIZE {
@@ -159,7 +237,7 @@ mod platform {
                 });
             }
         }
-        wait_for_response(&device, id)
+        wait_for_response(device, id)
     }
 
     fn wait_for_response(device: &HidDevice, id: u16) -> Result<(), DeviceError> {
@@ -202,6 +280,18 @@ mod platform {
 
         Err(DeviceError::ResponseTimeout)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::DeviceError;
+
+        #[test]
+        fn reconnect_policy_is_limited_to_transport_failures() {
+            assert!(DeviceError::ResponseTimeout.is_transport_failure());
+            assert!(!DeviceError::Rpc("rejected".into()).is_transport_failure());
+            assert!(!DeviceError::LockTimeout.is_transport_failure());
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -217,6 +307,30 @@ mod platform {
     pub struct DeviceSummary {
         pub product: Option<String>,
         pub serial: Option<String>,
+    }
+
+    pub struct Controller;
+
+    impl Controller {
+        pub fn open() -> Result<Self, DeviceError> {
+            Err(DeviceError)
+        }
+
+        pub fn set_ambient(
+            &mut self,
+            _id: u16,
+            _effect: LightingEffect,
+            _packed_rgb: u32,
+            _brightness: f32,
+            _speed: f32,
+            _magic: f32,
+        ) -> Result<(), DeviceError> {
+            Err(DeviceError)
+        }
+
+        pub fn clear(&mut self, _id: u16) -> Result<(), DeviceError> {
+            Err(DeviceError)
+        }
     }
 
     pub fn probe() -> Result<DeviceSummary, DeviceError> {

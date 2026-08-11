@@ -1,4 +1,4 @@
-use image::DynamicImage;
+use image::{DynamicImage, GenericImageView};
 
 #[derive(Clone, Debug)]
 pub struct TrackSnapshot {
@@ -8,21 +8,77 @@ pub struct TrackSnapshot {
     pub album: Option<String>,
     pub bundle_id: Option<String>,
     pub artwork: Option<DynamicImage>,
+    pub artwork_signature: Option<u64>,
 }
 
 impl TrackSnapshot {
     pub fn track_key(&self) -> Option<String> {
-        let title = self.title.as_deref()?.trim();
-        if title.is_empty() {
+        let bundle_id = normalized(self.bundle_id.as_deref());
+        let title = normalized(self.title.as_deref());
+        let artist = normalized(self.artist.as_deref());
+        let album = normalized(self.album.as_deref());
+        if [bundle_id, title, artist, album]
+            .into_iter()
+            .all(str::is_empty)
+            && self.artwork_signature.is_none()
+        {
             return None;
         }
         Some(format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-            self.bundle_id.as_deref().unwrap_or_default(),
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:016x}",
+            bundle_id,
             title,
-            self.artist.as_deref().unwrap_or_default(),
-            self.album.as_deref().unwrap_or_default()
+            artist,
+            album,
+            self.artwork_signature.unwrap_or_default()
         ))
+    }
+}
+
+fn normalized(value: Option<&str>) -> &str {
+    value.map(str::trim).unwrap_or_default()
+}
+
+fn artwork_signature(image: &DynamicImage) -> u64 {
+    let (width, height) = image.dimensions();
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in width.to_le_bytes().into_iter().chain(height.to_le_bytes()) {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    if width == 0 || height == 0 {
+        return hash;
+    }
+    for grid_y in 0..5_u64 {
+        for grid_x in 0..5_u64 {
+            let x = (u64::from(width - 1) * grid_x / 4) as u32;
+            let y = (u64::from(height - 1) * grid_y / 4) as u32;
+            for byte in image.get_pixel(x, y).0 {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    hash
+}
+
+#[derive(Default)]
+struct ArtworkDelivery {
+    last_key: Option<String>,
+}
+
+impl ArtworkDelivery {
+    fn should_deliver(&mut self, key: Option<&str>, artwork_available: bool) -> bool {
+        let Some(key) = key.filter(|_| artwork_available) else {
+            return false;
+        };
+        if self.last_key.as_deref() == Some(key) {
+            return false;
+        }
+        self.last_key = Some(key.to_owned());
+        true
+    }
+
+    fn invalidate(&mut self) {
+        self.last_key = None;
     }
 }
 
@@ -37,11 +93,11 @@ mod platform {
     use anyhow::{bail, Context, Result};
     use media_remote::NowPlayingPerl;
 
-    use super::TrackSnapshot;
+    use super::{artwork_signature, ArtworkDelivery, TrackSnapshot};
 
     pub struct MediaRemoteSource {
         remote: NowPlayingPerl,
-        last_artwork_key: RefCell<Option<String>>,
+        artwork_delivery: RefCell<ArtworkDelivery>,
     }
 
     impl MediaRemoteSource {
@@ -55,7 +111,7 @@ mod platform {
             })?;
             Ok(Self {
                 remote,
-                last_artwork_key: RefCell::new(None),
+                artwork_delivery: RefCell::new(ArtworkDelivery::default()),
             })
         }
 
@@ -69,16 +125,21 @@ mod platform {
                 album: info.album.clone(),
                 bundle_id: info.bundle_id.clone(),
                 artwork: None,
+                artwork_signature: info.album_cover.as_ref().map(artwork_signature),
             };
             let key = snapshot.track_key();
-            let should_copy_artwork = info.album_cover.is_some()
-                && key.is_some()
-                && self.last_artwork_key.borrow().as_ref() != key.as_ref();
+            let should_copy_artwork = self
+                .artwork_delivery
+                .borrow_mut()
+                .should_deliver(key.as_deref(), info.album_cover.is_some());
             if should_copy_artwork {
                 snapshot.artwork = info.album_cover.clone();
-                *self.last_artwork_key.borrow_mut() = key;
             }
             Some(snapshot)
+        }
+
+        pub fn invalidate_artwork_delivery(&self) {
+            self.artwork_delivery.borrow_mut().invalidate();
         }
     }
 
@@ -119,6 +180,8 @@ mod platform {
         pub fn snapshot(&self) -> Option<TrackSnapshot> {
             None
         }
+
+        pub fn invalidate_artwork_delivery(&self) {}
     }
 }
 
@@ -136,6 +199,7 @@ mod tests {
             album: Some("Album".into()),
             bundle_id: bundle_id.map(str::to_owned),
             artwork: None,
+            artwork_signature: None,
         }
     }
 
@@ -148,16 +212,53 @@ mod tests {
     }
 
     #[test]
-    fn track_key_requires_a_title() {
-        assert!(snapshot(Some("com.apple.Music"), None)
-            .track_key()
-            .is_none());
+    fn track_key_requires_some_content_identity() {
+        let mut empty = snapshot(None, None);
+        empty.artist = None;
+        empty.album = None;
+        assert!(empty.track_key().is_none());
         assert!(snapshot(Some("com.apple.Music"), Some("  "))
             .track_key()
-            .is_none());
+            .is_some());
         assert_eq!(
             snapshot(Some("com.apple.Music"), Some("Song")).track_key(),
-            Some("com.apple.Music\u{1f}Song\u{1f}Artist\u{1f}Album".into())
+            Some("com.apple.Music\u{1f}Song\u{1f}Artist\u{1f}Album\u{1f}0000000000000000".into())
         );
+    }
+
+    #[test]
+    fn track_key_accepts_artwork_without_a_title_and_tracks_artwork_changes() {
+        let mut first = snapshot(Some("com.example.browser"), None);
+        first.artist = None;
+        first.album = None;
+        first.artwork_signature = Some(1);
+        let mut second = first.clone();
+        second.artwork_signature = Some(2);
+
+        assert!(first.track_key().is_some());
+        assert_ne!(first.track_key(), second.track_key());
+    }
+
+    #[test]
+    fn artwork_signature_is_deterministic_and_sensitive_to_sampled_pixels() {
+        use image::{Rgba, RgbaImage};
+
+        let first = DynamicImage::ImageRgba8(RgbaImage::from_pixel(3, 3, Rgba([10, 20, 30, 255])));
+        let mut changed = first.clone().to_rgba8();
+        changed.put_pixel(1, 1, Rgba([30, 20, 10, 255]));
+        let changed = DynamicImage::ImageRgba8(changed);
+
+        assert_eq!(artwork_signature(&first), artwork_signature(&first));
+        assert_ne!(artwork_signature(&first), artwork_signature(&changed));
+    }
+
+    #[test]
+    fn artwork_can_be_delivered_again_after_consumer_invalidation() {
+        let mut delivery = ArtworkDelivery::default();
+
+        assert!(delivery.should_deliver(Some("track"), true));
+        assert!(!delivery.should_deliver(Some("track"), true));
+        delivery.invalidate();
+        assert!(delivery.should_deliver(Some("track"), true));
     }
 }

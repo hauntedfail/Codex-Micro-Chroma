@@ -22,6 +22,8 @@ pub fn render_launch_agent(executable: &Path, log_directory: &Path) -> String {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
     <key>ProcessType</key>
     <string>Background</string>
     <key>StandardOutPath</key>
@@ -82,10 +84,17 @@ mod platform {
         )
         .context("could not create the LaunchAgents directory")?;
 
-        fs::copy(&current_executable, &paths.executable)
-            .context("could not install the worker executable")?;
-        fs::set_permissions(&paths.executable, fs::Permissions::from_mode(0o755))
-            .context("could not make the installed worker executable")?;
+        let temporary_executable = paths.executable.with_extension("tmp");
+        fs::copy(&current_executable, &temporary_executable)
+            .context("could not prepare the worker executable")?;
+        fs::set_permissions(&temporary_executable, fs::Permissions::from_mode(0o755))
+            .context("could not make the prepared worker executable")?;
+        if let Err(error) = sign_executable(&temporary_executable) {
+            let _ = fs::remove_file(&temporary_executable);
+            return Err(error);
+        }
+        fs::rename(&temporary_executable, &paths.executable)
+            .context("could not atomically install the worker executable")?;
 
         let plist = render_launch_agent(&paths.executable, &paths.log_directory);
         let temporary_plist = paths.plist.with_extension("plist.tmp");
@@ -104,7 +113,7 @@ mod platform {
             domain,
             paths.plist.clone().into(),
         ])?;
-        ensure_launchctl_success(output, "bootstrap LaunchAgent")?;
+        ensure_command_success(output, "bootstrap LaunchAgent")?;
         Ok(paths)
     }
 
@@ -148,7 +157,16 @@ mod platform {
             .context("could not execute launchctl")
     }
 
-    fn ensure_launchctl_success(output: Output, action: &str) -> Result<()> {
+    fn sign_executable(executable: &std::path::Path) -> Result<()> {
+        let output = Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--identifier", LAUNCH_AGENT_LABEL])
+            .arg(executable)
+            .output()
+            .context("could not execute codesign")?;
+        ensure_command_success(output, "ad-hoc sign the installed worker")
+    }
+
+    fn ensure_command_success(output: Output, action: &str) -> Result<()> {
         if output.status.success() {
             return Ok(());
         }
@@ -156,7 +174,7 @@ mod platform {
         bail!(
             "could not {action}: {}",
             if detail.is_empty() {
-                format!("launchctl exited with {}", output.status)
+                format!("command exited with {}", output.status)
             } else {
                 detail
             }

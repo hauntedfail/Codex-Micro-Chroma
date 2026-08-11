@@ -1,5 +1,8 @@
+pub mod audio;
 pub mod color;
 pub mod hid;
+pub mod lighting;
 pub mod media;
 pub mod protocol;
 pub mod service;
+pub mod system_audio;

@@ -9,16 +9,39 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use codex_micro_chroma::{
     color::{ambient_color, Rgb},
     hid,
+    lighting::{LightingComposer, LightingScene},
     media::{MediaRemoteSource, TrackSnapshot},
     protocol::LightingEffect,
     service,
+    system_audio::SystemAudioSource,
 };
 
 static NEXT_REQUEST_ID: AtomicU16 = AtomicU16::new(1);
+const STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const AUDIO_FRAME_STALL_THRESHOLD: Duration = Duration::from_secs(3);
+const AUDIO_ZERO_RECOVERY_THRESHOLD: Duration = Duration::from_secs(15);
+const AUDIO_RECOVERY_COOLDOWN: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AudioRecoveryReason {
+    Missing,
+    Stalled,
+    ZeroFilled,
+}
+
+impl std::fmt::Display for AudioRecoveryReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Missing => "audio source is unavailable",
+            Self::Stalled => "audio callbacks stopped advancing",
+            Self::ZeroFilled => "audio callbacks remained zero-filled",
+        })
+    }
+}
 
 #[derive(Parser)]
 #[command(version, about = "macOS Now Playing artwork lighting for Codex Micro")]
@@ -33,6 +56,8 @@ enum Command {
     Probe,
     /// Print the current local Now Playing information and detected color.
     Status(StatusArgs),
+    /// Print real-time audio features from a Core Audio Process Tap as JSON lines.
+    AudioProbe(AudioProbeArgs),
     /// Follow macOS Now Playing and keep the Codex Micro ambient ring updated.
     Run(RunArgs),
     /// Set one ambient-ring color without reading Now Playing.
@@ -52,9 +77,27 @@ struct StatusArgs {
 }
 
 #[derive(Args)]
+struct AudioProbeArgs {
+    #[arg(long, default_value_t = 15)]
+    seconds: u64,
+    #[arg(long, default_value_t = 100)]
+    interval_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RunMode {
+    Reactive,
+    Static,
+}
+
+#[derive(Args)]
 struct RunArgs {
+    #[arg(long, value_enum, default_value_t = RunMode::Reactive)]
+    mode: RunMode,
+    /// Static effect, and the fallback before the first reactive audio frame.
     #[arg(long, default_value = "breath", value_parser = parse_lighting_effect)]
     effect: LightingEffect,
+    /// Master brightness in reactive mode; fixed brightness in static mode.
     #[arg(long, default_value_t = 1.0)]
     brightness: f32,
     #[arg(long, default_value_t = 0.85)]
@@ -65,6 +108,9 @@ struct RunArgs {
     poll_ms: u64,
     #[arg(long, default_value_t = 750)]
     refresh_ms: u64,
+    /// Reactive HID update interval. Lower values are more responsive but harder on the device.
+    #[arg(long, default_value_t = 100)]
+    device_ms: u64,
 }
 
 #[derive(Args)]
@@ -85,6 +131,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Probe => probe(),
         Command::Status(arguments) => status(arguments),
+        Command::AudioProbe(arguments) => audio_probe(arguments),
         Command::Run(arguments) => run(arguments),
         Command::Set(arguments) => {
             hid::set_ambient(
@@ -174,10 +221,33 @@ fn status(arguments: StatusArgs) -> Result<()> {
     Ok(())
 }
 
+fn audio_probe(arguments: AudioProbeArgs) -> Result<()> {
+    if arguments.seconds == 0 || arguments.interval_ms == 0 {
+        bail!("seconds and interval-ms must be greater than zero");
+    }
+    let source = SystemAudioSource::start().context("Core Audio Process Tap could not start")?;
+    println!("Core Audio Process Tap: {:.0} Hz", source.sample_rate());
+    println!("Play audio now; feature frames follow as JSON lines.");
+
+    let deadline = Instant::now() + Duration::from_secs(arguments.seconds);
+    let interval = Duration::from_millis(arguments.interval_ms);
+    let mut last_timestamp = None;
+    while Instant::now() < deadline {
+        if let Some(frame) = source.latest() {
+            if last_timestamp != Some(frame.timestamp_seconds) {
+                println!("{}", serde_json::to_string(&frame)?);
+                last_timestamp = Some(frame.timestamp_seconds);
+            }
+        }
+        thread::sleep(interval);
+    }
+    Ok(())
+}
+
 fn run(arguments: RunArgs) -> Result<()> {
     validate_effect_parameters(arguments.brightness, arguments.speed, arguments.magic)?;
-    if arguments.poll_ms == 0 || arguments.refresh_ms == 0 {
-        bail!("poll-ms and refresh-ms must be greater than zero");
+    if arguments.poll_ms == 0 || arguments.refresh_ms == 0 || arguments.device_ms == 0 {
+        bail!("poll-ms, refresh-ms, and device-ms must be greater than zero");
     }
 
     let running = Arc::new(AtomicBool::new(true));
@@ -185,58 +255,132 @@ fn run(arguments: RunArgs) -> Result<()> {
     ctrlc::set_handler(move || signal_state.store(false, Ordering::SeqCst))
         .context("could not install the shutdown handler")?;
 
+    let Some(mut controller) = wait_for_controller(&running) else {
+        println!("Stopped before the Codex Micro LED controller became available");
+        return Ok(());
+    };
     let source = MediaRemoteSource::new()?;
+    let mut audio = match arguments.mode {
+        RunMode::Reactive => {
+            let Some(source) = wait_for_audio_source(&running) else {
+                println!("Stopped before Core Audio Process Tap became available");
+                return Ok(());
+            };
+            Some(source)
+        }
+        RunMode::Static => None,
+    };
     let poll_interval = Duration::from_millis(arguments.poll_ms);
-    let refresh_interval = Duration::from_millis(arguments.refresh_ms);
+    let refresh_interval = match arguments.mode {
+        RunMode::Reactive => Duration::from_millis(arguments.device_ms),
+        RunMode::Static => Duration::from_millis(arguments.refresh_ms),
+    };
     let mut current_key = None::<String>;
     let mut observed_key = None::<String>;
     let mut current_color = None::<Rgb>;
+    let mut composer = None::<LightingComposer>;
+    let mut current_scene = None::<LightingScene>;
+    let mut last_audio_timestamp = None::<f64>;
+    let mut last_composer_update = Instant::now();
+    let mut last_effect = None::<LightingEffect>;
     let mut next_refresh = Instant::now();
+    let mut next_media_poll = Instant::now();
     let mut last_hid_error = None::<String>;
+    let mut playback_active = false;
+    let mut last_audio_frame_at = Instant::now();
+    let mut zero_audio_since = None::<Instant>;
+    let mut next_audio_recovery = Instant::now() + AUDIO_RECOVERY_COOLDOWN;
 
-    println!(
-        "Following local macOS Now Playing with {}. Press Control-C to stop and clear the ring.",
-        arguments.effect
-    );
+    match arguments.mode {
+        RunMode::Reactive => println!(
+            "Following Now Playing color with reactive system-audio lighting at {:.0} Hz. Press Control-C to stop.",
+            audio.as_ref().map_or(0.0, SystemAudioSource::sample_rate)
+        ),
+        RunMode::Static => println!(
+            "Following local macOS Now Playing with static {}. Press Control-C to stop.",
+            arguments.effect
+        ),
+    }
     while running.load(Ordering::SeqCst) {
-        if let Some(snapshot) = source.snapshot() {
-            if snapshot.is_playing == Some(true) {
-                if let Some(key) = snapshot.track_key() {
-                    if observed_key.as_deref() != Some(&key) {
-                        observed_key = Some(key.clone());
-                        current_key = None;
-                        if current_color.take().is_some() {
-                            match hid::clear(next_request_id()) {
-                                Ok(()) => {
-                                    println!("Now Playing changed; waiting for the new thumbnail")
-                                }
-                                Err(error) => {
-                                    eprintln!(
-                                        "Could not clear the previous thumbnail color: {error}"
-                                    )
+        if Instant::now() >= next_media_poll {
+            next_media_poll = Instant::now() + poll_interval;
+            if let Some(snapshot) = source.snapshot() {
+                if snapshot.is_playing == Some(false) {
+                    playback_active = false;
+                    zero_audio_since = None;
+                    source.invalidate_artwork_delivery();
+                    observed_key = None;
+                    current_key = None;
+                    composer = None;
+                    current_scene = None;
+                    last_audio_timestamp = None;
+                    last_effect = None;
+                    if current_color.take().is_some() {
+                        match controller.clear(next_request_id()) {
+                            Ok(()) => println!("Now Playing paused; lighting cleared"),
+                            Err(error) => eprintln!("Could not clear paused lighting: {error}"),
+                        }
+                    }
+                } else if snapshot.is_playing == Some(true) {
+                    if !playback_active {
+                        last_audio_frame_at = Instant::now();
+                        zero_audio_since = None;
+                    }
+                    playback_active = true;
+                    if let Some(key) = snapshot.track_key() {
+                        if observed_key.as_deref() != Some(&key) {
+                            observed_key = Some(key.clone());
+                            current_key = None;
+                            composer = None;
+                            current_scene = None;
+                            last_audio_timestamp = None;
+                            last_effect = None;
+                            if current_color.take().is_some() {
+                                match controller.clear(next_request_id()) {
+                                    Ok(()) => {
+                                        println!(
+                                            "Now Playing changed; waiting for the new thumbnail"
+                                        )
+                                    }
+                                    Err(error) => {
+                                        eprintln!(
+                                            "Could not clear the previous thumbnail color: {error}"
+                                        )
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    if current_key.as_deref() != Some(&key) {
-                        if let Some(artwork) = snapshot.artwork.as_ref() {
-                            match ambient_color(artwork) {
-                                Ok(color) => {
-                                    println!(
-                                        "{} — {} [{}] -> {} ({})",
-                                        snapshot.artist.as_deref().unwrap_or("unknown artist"),
-                                        snapshot.title.as_deref().unwrap_or("unknown title"),
-                                        snapshot.bundle_id.as_deref().unwrap_or("unknown app"),
-                                        color.to_hex(),
-                                        arguments.effect
-                                    );
-                                    current_key = Some(key);
-                                    current_color = Some(color);
-                                    next_refresh = Instant::now();
-                                }
-                                Err(error) => {
-                                    eprintln!("Thumbnail color extraction failed: {error}")
+                        if current_key.as_deref() != Some(&key) {
+                            if let Some(artwork) = snapshot.artwork.as_ref() {
+                                match ambient_color(artwork) {
+                                    Ok(color) => {
+                                        println!(
+                                            "{} — {} [{}] -> {} ({})",
+                                            snapshot.artist.as_deref().unwrap_or("unknown artist"),
+                                            snapshot.title.as_deref().unwrap_or("unknown title"),
+                                            snapshot.bundle_id.as_deref().unwrap_or("unknown app"),
+                                            color.to_hex(),
+                                            arguments.effect
+                                        );
+                                        current_key = Some(key);
+                                        current_color = Some(color);
+                                        composer = Some(LightingComposer::new(color));
+                                        current_scene = Some(LightingScene {
+                                            effect: arguments.effect,
+                                            color,
+                                            brightness: arguments.brightness,
+                                            speed: arguments.speed,
+                                            magic: arguments.magic,
+                                        });
+                                        last_audio_timestamp = None;
+                                        last_composer_update = Instant::now();
+                                        next_refresh = Instant::now();
+                                    }
+                                    Err(error) => {
+                                        eprintln!("Thumbnail color extraction failed: {error}");
+                                        source.invalidate_artwork_delivery();
+                                    }
                                 }
                             }
                         }
@@ -245,14 +389,74 @@ fn run(arguments: RunArgs) -> Result<()> {
             }
         }
 
-        if let Some(color) = current_color.filter(|_| Instant::now() >= next_refresh) {
-            match hid::set_ambient(
+        if let Some(audio) = audio.as_ref() {
+            if let Some(frame) = audio.latest() {
+                if last_audio_timestamp != Some(frame.timestamp_seconds) {
+                    let now = Instant::now();
+                    last_audio_frame_at = now;
+                    if frame.silent {
+                        zero_audio_since.get_or_insert(now);
+                    } else {
+                        zero_audio_since = None;
+                    }
+                    let elapsed = now.saturating_duration_since(last_composer_update);
+                    last_composer_update = now;
+                    last_audio_timestamp = Some(frame.timestamp_seconds);
+                    if let Some(composer) = composer.as_mut() {
+                        let mut scene = composer.update(frame, elapsed);
+                        scene.brightness =
+                            (scene.brightness * arguments.brightness).clamp(0.0, 1.0);
+                        current_scene = Some(scene);
+                        if last_effect != Some(scene.effect) {
+                            println!(
+                                "Audio scene -> {} (brightness {:.2}, speed {:.2}, magic {:.2})",
+                                scene.effect, scene.brightness, scene.speed, scene.magic
+                            );
+                            last_effect = Some(scene.effect);
+                        }
+                    }
+                }
+            }
+        }
+
+        let now = Instant::now();
+        let recovery_reason = audio_recovery_reason(
+            arguments.mode == RunMode::Reactive,
+            playback_active,
+            audio.is_some(),
+            now.saturating_duration_since(last_audio_frame_at),
+            zero_audio_since.map(|since| now.saturating_duration_since(since)),
+            now >= next_audio_recovery,
+        );
+        if let Some(reason) = recovery_reason {
+            eprintln!("Core Audio Process Tap recovery: {reason}");
+            audio.take();
+            match SystemAudioSource::start() {
+                Ok(replacement) => {
+                    println!(
+                        "Core Audio Process Tap recovered at {:.0} Hz",
+                        replacement.sample_rate()
+                    );
+                    audio = Some(replacement);
+                }
+                Err(error) => {
+                    eprintln!("Core Audio Process Tap recovery failed; will retry: {error}");
+                }
+            }
+            last_audio_timestamp = None;
+            last_audio_frame_at = Instant::now();
+            zero_audio_since = None;
+            next_audio_recovery = Instant::now() + AUDIO_RECOVERY_COOLDOWN;
+        }
+
+        if let Some(scene) = current_scene.filter(|_| Instant::now() >= next_refresh) {
+            match controller.set_ambient(
                 next_request_id(),
-                arguments.effect,
-                color.packed(),
-                arguments.brightness,
-                arguments.speed,
-                arguments.magic,
+                scene.effect,
+                scene.color.packed(),
+                scene.brightness,
+                scene.speed,
+                scene.magic,
             ) {
                 Ok(()) => last_hid_error = None,
                 Err(error) => {
@@ -266,13 +470,90 @@ fn run(arguments: RunArgs) -> Result<()> {
             next_refresh = Instant::now() + refresh_interval;
         }
 
-        thread::sleep(poll_interval);
+        // MediaRemote can be polled comparatively slowly, while audio frames and the HID
+        // governor need a tighter wake-up cadence for perceptually responsive lighting.
+        thread::sleep(Duration::from_millis(20));
     }
 
-    hid::clear(next_request_id())
+    controller
+        .clear(next_request_id())
         .context("stopped, but the Codex Micro ring could not be cleared")?;
     println!("Stopped and cleared the Codex Micro ring");
     Ok(())
+}
+
+fn audio_recovery_reason(
+    reactive: bool,
+    playback_active: bool,
+    audio_available: bool,
+    since_last_frame: Duration,
+    zero_audio_for: Option<Duration>,
+    cooldown_elapsed: bool,
+) -> Option<AudioRecoveryReason> {
+    if !reactive || !playback_active || !cooldown_elapsed {
+        return None;
+    }
+    if !audio_available {
+        return Some(AudioRecoveryReason::Missing);
+    }
+    if since_last_frame >= AUDIO_FRAME_STALL_THRESHOLD {
+        return Some(AudioRecoveryReason::Stalled);
+    }
+    if zero_audio_for.is_some_and(|duration| duration >= AUDIO_ZERO_RECOVERY_THRESHOLD) {
+        return Some(AudioRecoveryReason::ZeroFilled);
+    }
+    None
+}
+
+fn wait_for_controller(running: &AtomicBool) -> Option<hid::Controller> {
+    let mut last_error = None::<String>;
+    while running.load(Ordering::SeqCst) {
+        match hid::Controller::open() {
+            Ok(controller) => {
+                println!("Codex Micro LED controller connected");
+                return Some(controller);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if last_error.as_deref() != Some(&message) {
+                    eprintln!(
+                        "Codex Micro LED controller is unavailable; waiting for the device or Input Monitoring permission: {message}"
+                    );
+                    last_error = Some(message);
+                }
+            }
+        }
+
+        let retry_at = Instant::now() + STARTUP_RETRY_INTERVAL;
+        while running.load(Ordering::SeqCst) && Instant::now() < retry_at {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    None
+}
+
+fn wait_for_audio_source(running: &AtomicBool) -> Option<SystemAudioSource> {
+    let mut last_error = None::<String>;
+    while running.load(Ordering::SeqCst) {
+        match SystemAudioSource::start() {
+            Ok(source) => return Some(source),
+            Err(error) => {
+                let message = error.to_string();
+                if last_error.as_deref() != Some(&message) {
+                    eprintln!(
+                        "Core Audio Process Tap is unavailable; waiting for System Audio Recording permission: {message}"
+                    );
+                    last_error = Some(message);
+                }
+            }
+        }
+
+        let retry_at = Instant::now() + STARTUP_RETRY_INTERVAL;
+        while running.load(Ordering::SeqCst) && Instant::now() < retry_at {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    None
 }
 
 fn wait_for_snapshot(source: &MediaRemoteSource, timeout: Duration) -> Option<TrackSnapshot> {
@@ -384,5 +665,61 @@ mod tests {
             panic!("expected set command");
         };
         assert_eq!(arguments.effect, LightingEffect::Breath);
+    }
+
+    #[test]
+    fn audio_recovery_is_gated_by_playback_mode_and_cooldown() {
+        assert_eq!(
+            audio_recovery_reason(true, true, true, AUDIO_FRAME_STALL_THRESHOLD, None, true,),
+            Some(AudioRecoveryReason::Stalled)
+        );
+        assert_eq!(
+            audio_recovery_reason(
+                true,
+                true,
+                true,
+                Duration::ZERO,
+                Some(AUDIO_ZERO_RECOVERY_THRESHOLD),
+                true,
+            ),
+            Some(AudioRecoveryReason::ZeroFilled)
+        );
+        assert_eq!(
+            audio_recovery_reason(true, true, false, Duration::ZERO, None, true),
+            Some(AudioRecoveryReason::Missing)
+        );
+        assert_eq!(
+            audio_recovery_reason(
+                false,
+                true,
+                false,
+                AUDIO_FRAME_STALL_THRESHOLD,
+                Some(AUDIO_ZERO_RECOVERY_THRESHOLD),
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            audio_recovery_reason(
+                true,
+                false,
+                false,
+                AUDIO_FRAME_STALL_THRESHOLD,
+                Some(AUDIO_ZERO_RECOVERY_THRESHOLD),
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            audio_recovery_reason(
+                true,
+                true,
+                false,
+                AUDIO_FRAME_STALL_THRESHOLD,
+                Some(AUDIO_ZERO_RECOVERY_THRESHOLD),
+                false,
+            ),
+            None
+        );
     }
 }

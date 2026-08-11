@@ -18,6 +18,21 @@ fn chooses_the_dominant_non_white_opaque_color() {
 }
 
 #[test]
+fn near_white_thumbnail_background_does_not_overpower_accent_color() {
+    let mut image = RgbaImage::from_pixel(20, 20, Rgba([250, 248, 248, 255]));
+    for x in 0..4 {
+        for y in 0..20 {
+            image.put_pixel(x, y, Rgba([25, 80, 200, 255]));
+        }
+    }
+
+    let color = ambient_color(&DynamicImage::ImageRgba8(image)).unwrap();
+
+    assert!(u16::from(color.blue) > u16::from(color.red) * 2);
+    assert!(u16::from(color.blue) > u16::from(color.green) * 2);
+}
+
+#[test]
 fn ignores_transparent_pixels() {
     let mut image = RgbaImage::from_pixel(4, 4, Rgba([0, 255, 0, 0]));
     image.put_pixel(0, 0, Rgba([20, 40, 180, 255]));

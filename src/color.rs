@@ -61,15 +61,14 @@ pub fn ambient_color(image: &DynamicImage) -> Result<Rgb, ColorError> {
 
     for (_, _, pixel) in image.pixels() {
         let [red, green, blue, alpha] = pixel.0;
-        if alpha < 125 || (red > 250 && green > 250 && blue > 250) {
+        let color = Rgb::new(red, green, blue);
+        let (_, saturation, value) = rgb_to_hsv(color);
+        if alpha < 125 || (value >= 0.88 && saturation <= 0.14) || value <= 0.03 {
             continue;
         }
 
         let key = (u16::from(red >> 4) << 8) | (u16::from(green >> 4) << 4) | u16::from(blue >> 4);
-        buckets
-            .entry(key)
-            .or_default()
-            .add(Rgb::new(red, green, blue));
+        buckets.entry(key).or_default().add(color);
     }
 
     let dominant = buckets
@@ -88,7 +87,7 @@ pub fn ambient_color(image: &DynamicImage) -> Result<Rgb, ColorError> {
 fn bucket_score(bucket: &Bucket) -> f32 {
     let color = bucket.average();
     let (_, saturation, value) = rgb_to_hsv(color);
-    bucket.count as f32 * (0.25 + 0.75 * saturation) * (0.4 + 0.6 * value)
+    bucket.count as f32 * (0.05 + 0.95 * saturation.sqrt()) * (0.3 + 0.7 * value)
 }
 
 fn boost(color: Rgb, saturation_multiplier: f32, brightness_multiplier: f32) -> Rgb {
