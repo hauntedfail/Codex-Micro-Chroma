@@ -15,6 +15,8 @@ use crate::{
 const COMPLETE_EDGE_TOLERANCE_SECONDS: f64 = 2.0;
 const COMPLETE_OBSERVED_FRACTION: f64 = 0.85;
 const MAX_ACCOUNTING_STEP_SECONDS: f64 = 1.0;
+const RESTART_POSITION_MAX_SECONDS: f64 = 5.0;
+const RESTART_MIN_BACKWARD_SECONDS: f64 = 30.0;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TrackMetadata {
@@ -82,13 +84,21 @@ impl TrackUsageTracker {
         }
     }
 
-    pub fn update_snapshot(&mut self, snapshot: &TrackSnapshot) {
+    pub fn update_snapshot(&mut self, snapshot: &TrackSnapshot) -> bool {
         if let Some(duration) = valid_time(snapshot.duration) {
             self.track.duration_seconds = Some(duration);
         }
         if let Some(position) = valid_time(snapshot.elapsed_time) {
+            let restarted = self.latest_position.is_some_and(|previous| {
+                position <= RESTART_POSITION_MAX_SECONDS
+                    && previous - position >= RESTART_MIN_BACKWARD_SECONDS
+            });
+            if restarted {
+                return true;
+            }
             self.latest_position = Some(position);
         }
+        false
     }
 
     pub fn observe_scene(&mut self, effect: LightingEffect, elapsed: Duration) -> bool {
@@ -107,6 +117,7 @@ impl TrackUsageTracker {
     }
 
     pub fn summary(&self, reason: impl Into<String>) -> TrackSummary {
+        let reason = reason.into();
         let duration = self.track.duration_seconds;
         let started_near_beginning = self
             .started_at_position
@@ -119,6 +130,7 @@ impl TrackUsageTracker {
                 });
         let observed_enough = duration
             .is_some_and(|duration| self.observed_seconds >= duration * COMPLETE_OBSERVED_FRACTION);
+        let ended_by_position_restart = reason == "position_restarted" && observed_enough;
         let denominator = self.observed_seconds.max(f64::EPSILON);
         let effect_usage = LightingEffect::ALL
             .into_iter()
@@ -134,12 +146,14 @@ impl TrackUsageTracker {
 
         TrackSummary {
             track: self.track.clone(),
-            reason: reason.into(),
+            reason,
             started_at_position_seconds: self.started_at_position,
             ended_at_position_seconds: self.latest_position,
             observed_seconds: self.observed_seconds,
             transitions: self.transitions,
-            complete_track: started_near_beginning && ended_near_end && observed_enough,
+            complete_track: started_near_beginning
+                && (ended_near_end || ended_by_position_restart)
+                && observed_enough,
             effect_usage,
         }
     }
@@ -216,10 +230,10 @@ impl TrackLogger {
         Ok(path)
     }
 
-    pub fn update_snapshot(&mut self, snapshot: &TrackSnapshot) {
-        if let Some(active) = self.active.as_mut() {
-            active.tracker.update_snapshot(snapshot);
-        }
+    pub fn update_snapshot(&mut self, snapshot: &TrackSnapshot) -> bool {
+        self.active
+            .as_mut()
+            .is_some_and(|active| active.tracker.update_snapshot(snapshot))
     }
 
     pub fn observe_scene(

@@ -71,6 +71,33 @@ fn starting_mid_song_is_reported_as_incomplete() {
 }
 
 #[test]
+fn same_track_position_restart_finishes_one_crossfaded_playthrough() {
+    let mut tracker = TrackUsageTracker::new("track", &snapshot(0.2, 207.0));
+    for _ in 0..180 {
+        tracker.observe_scene(LightingEffect::Breath, Duration::from_secs(1));
+    }
+    assert!(!tracker.update_snapshot(&snapshot(191.0, 207.0)));
+    assert!(tracker.update_snapshot(&snapshot(0.4, 207.0)));
+
+    let summary = tracker.summary("position_restarted");
+    assert!(summary.complete_track);
+    assert_eq!(summary.ended_at_position_seconds, Some(191.0));
+    assert_eq!(summary.observed_seconds, 180.0);
+}
+
+#[test]
+fn early_manual_restart_is_not_reported_as_a_complete_track() {
+    let mut tracker = TrackUsageTracker::new("track", &snapshot(0.0, 207.0));
+    for _ in 0..60 {
+        tracker.observe_scene(LightingEffect::Breath, Duration::from_secs(1));
+    }
+    assert!(!tracker.update_snapshot(&snapshot(60.0, 207.0)));
+    assert!(tracker.update_snapshot(&snapshot(0.0, 207.0)));
+
+    assert!(!tracker.summary("position_restarted").complete_track);
+}
+
+#[test]
 fn logger_flushes_start_transition_and_summary_as_json_lines() {
     let directory = std::env::temp_dir().join(format!(
         "codex-micro-chroma-telemetry-test-{}",

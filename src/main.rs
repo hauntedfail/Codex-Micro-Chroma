@@ -313,10 +313,17 @@ fn run(arguments: RunArgs) -> Result<()> {
             next_media_poll = Instant::now() + poll_interval;
             if let Some(snapshot) = source.snapshot() {
                 let snapshot_key = snapshot.track_key();
-                if let (Some(logger), Some(key)) = (track_logger.as_mut(), snapshot_key.as_deref())
+                let position_restarted = if let (Some(logger), Some(key)) =
+                    (track_logger.as_mut(), snapshot_key.as_deref())
                 {
-                    if logger.active_key() == Some(key) {
-                        logger.update_snapshot(&snapshot);
+                    logger.active_key() == Some(key) && logger.update_snapshot(&snapshot)
+                } else {
+                    false
+                };
+                if position_restarted {
+                    finish_track_log(&mut track_logger, "position_restarted");
+                    if let Some(key) = snapshot_key.as_deref() {
+                        start_track_log(&mut track_logger, key, &snapshot);
                     }
                 }
                 if snapshot.is_playing == Some(false) {

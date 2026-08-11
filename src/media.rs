@@ -1,5 +1,7 @@
 use image::{DynamicImage, GenericImageView};
 
+const POSITION_EDGE_TOLERANCE_SECONDS: f64 = 2.0;
+
 #[derive(Clone, Debug)]
 pub struct TrackSnapshot {
     pub is_playing: Option<bool>,
@@ -63,6 +65,42 @@ fn artwork_signature(image: &DynamicImage) -> u64 {
     hash
 }
 
+fn position_at_reception(
+    elapsed: Option<f64>,
+    duration: Option<f64>,
+    is_playing: Option<bool>,
+    playback_rate: Option<f64>,
+    update_age_seconds: Option<f64>,
+    resumed: bool,
+) -> Option<f64> {
+    let elapsed = elapsed.filter(|value| value.is_finite() && *value >= 0.0)?;
+    let duration = duration.filter(|value| value.is_finite() && *value > 0.0);
+    if duration.is_some_and(|duration| elapsed > duration + POSITION_EDGE_TOLERANCE_SECONDS) {
+        return None;
+    }
+    let rate = playback_rate
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or_else(|| f64::from(is_playing == Some(true)));
+    let update_age = update_age_seconds.filter(|value| value.is_finite() && *value >= 0.0);
+
+    // media-remote 0.5.2 projects elapsed time from MediaRemote's timestamp in
+    // get_info(), but that timestamp can remain at the start of a long pause when
+    // playback resumes. Anchor a resume at the newly delivered elapsed value.
+    let projected = if resumed || is_playing != Some(true) || rate == 0.0 {
+        elapsed
+    } else {
+        elapsed + update_age.unwrap_or(0.0) * rate
+    };
+
+    // A stale timestamp can put the projection beyond the track. In that case the
+    // payload's elapsed value is the only usable local anchor.
+    if duration.is_some_and(|duration| projected > duration + POSITION_EDGE_TOLERANCE_SECONDS) {
+        Some(elapsed)
+    } else {
+        Some(projected)
+    }
+}
+
 #[derive(Default)]
 struct ArtworkDelivery {
     last_key: Option<String>,
@@ -91,15 +129,82 @@ mod platform {
         cell::RefCell,
         path::Path,
         process::{Command, Stdio},
+        sync::{Arc, RwLock},
+        time::{Instant, SystemTime},
     };
 
     use anyhow::{bail, Context, Result};
-    use media_remote::NowPlayingPerl;
+    use media_remote::{ListenerToken, NowPlayingInfo, NowPlayingPerl, Subscription};
 
-    use super::{artwork_signature, ArtworkDelivery, TrackSnapshot};
+    use super::{artwork_signature, position_at_reception, ArtworkDelivery, TrackSnapshot};
+
+    struct ReceivedNowPlaying {
+        info: NowPlayingInfo,
+        position_at_received: Option<f64>,
+        received_at: Instant,
+    }
+
+    impl ReceivedNowPlaying {
+        fn from_event(info: NowPlayingInfo, previous: Option<&Self>) -> Self {
+            let received_at = Instant::now();
+            let resumed = previous.is_some_and(|previous| {
+                same_track(&previous.info, &info)
+                    && previous.info.is_playing == Some(false)
+                    && info.is_playing == Some(true)
+            });
+            let update_age_seconds = info.info_update_time.and_then(|updated_at| {
+                SystemTime::now()
+                    .duration_since(updated_at)
+                    .ok()
+                    .map(|age| age.as_secs_f64())
+            });
+            let position_at_received = position_at_reception(
+                info.elapsed_time,
+                info.duration,
+                info.is_playing,
+                info.playback_rate,
+                update_age_seconds,
+                resumed,
+            );
+            Self {
+                info,
+                position_at_received,
+                received_at,
+            }
+        }
+
+        fn elapsed_time(&self) -> Option<f64> {
+            let rate = self
+                .info
+                .playback_rate
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .unwrap_or_else(|| f64::from(self.info.is_playing == Some(true)));
+            let projected = self.position_at_received?
+                + if self.info.is_playing == Some(true) {
+                    self.received_at.elapsed().as_secs_f64() * rate
+                } else {
+                    0.0
+                };
+            Some(
+                self.info
+                    .duration
+                    .filter(|duration| duration.is_finite() && *duration > 0.0)
+                    .map_or(projected, |duration| projected.min(duration)),
+            )
+        }
+    }
+
+    fn same_track(left: &NowPlayingInfo, right: &NowPlayingInfo) -> bool {
+        left.bundle_id == right.bundle_id
+            && left.title == right.title
+            && left.artist == right.artist
+            && left.album == right.album
+    }
 
     pub struct MediaRemoteSource {
-        remote: NowPlayingPerl,
+        _remote: NowPlayingPerl,
+        _subscription: ListenerToken,
+        latest: Arc<RwLock<Option<ReceivedNowPlaying>>>,
         artwork_delivery: RefCell<ArtworkDelivery>,
     }
 
@@ -112,22 +217,36 @@ mod platform {
             let remote = std::panic::catch_unwind(NowPlayingPerl::new).map_err(|_| {
                 anyhow::anyhow!("MediaRemote Perl adapter could not be initialized")
             })?;
+            let latest = Arc::new(RwLock::new(None::<ReceivedNowPlaying>));
+            let listener_latest = Arc::clone(&latest);
+            let subscription = remote.subscribe(move |guard| {
+                let Some(info) = guard.as_ref().cloned() else {
+                    return;
+                };
+                if let Ok(mut latest) = listener_latest.write() {
+                    let received = ReceivedNowPlaying::from_event(info, latest.as_ref());
+                    *latest = Some(received);
+                }
+            });
             Ok(Self {
-                remote,
+                _remote: remote,
+                _subscription: subscription,
+                latest,
                 artwork_delivery: RefCell::new(ArtworkDelivery::default()),
             })
         }
 
         pub fn snapshot(&self) -> Option<TrackSnapshot> {
-            let guard = self.remote.get_info();
-            let info = guard.as_ref()?;
+            let guard = self.latest.read().ok()?;
+            let received = guard.as_ref()?;
+            let info = &received.info;
             let mut snapshot = TrackSnapshot {
                 is_playing: info.is_playing,
                 title: info.title.clone(),
                 artist: info.artist.clone(),
                 album: info.album.clone(),
                 bundle_id: info.bundle_id.clone(),
-                elapsed_time: info.elapsed_time,
+                elapsed_time: received.elapsed_time(),
                 duration: info.duration,
                 playback_rate: info.playback_rate,
                 artwork: None,
@@ -269,5 +388,65 @@ mod tests {
         assert!(!delivery.should_deliver(Some("track"), true));
         delivery.invalidate();
         assert!(delivery.should_deliver(Some("track"), true));
+    }
+
+    #[test]
+    fn resumed_playback_ignores_a_stale_media_remote_timestamp() {
+        assert_eq!(
+            position_at_reception(
+                Some(15.0),
+                Some(224.0),
+                Some(true),
+                Some(1.0),
+                Some(4_400.0),
+                true,
+            ),
+            Some(15.0)
+        );
+    }
+
+    #[test]
+    fn initial_playback_projects_a_plausible_media_remote_timestamp() {
+        assert_eq!(
+            position_at_reception(
+                Some(10.0),
+                Some(224.0),
+                Some(true),
+                Some(1.0),
+                Some(5.0),
+                false,
+            ),
+            Some(15.0)
+        );
+    }
+
+    #[test]
+    fn impossible_timestamp_projection_falls_back_to_payload_elapsed_time() {
+        assert_eq!(
+            position_at_reception(
+                Some(15.0),
+                Some(224.0),
+                Some(true),
+                Some(1.0),
+                Some(4_400.0),
+                false,
+            ),
+            Some(15.0)
+        );
+    }
+
+    #[test]
+    fn impossible_payload_elapsed_time_is_rejected() {
+        assert_eq!(
+            position_at_reception(
+                Some(4_400.0),
+                Some(224.0),
+                Some(true),
+                Some(1.0),
+                Some(0.0),
+                false,
+            ),
+            None
+        );
     }
 }
