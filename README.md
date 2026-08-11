@@ -1,18 +1,20 @@
 # Codex Micro Chroma
 
-macOSのNow Playingに表示されるアートワーク／サムネイルから代表色をローカルで抽出し、Core Audio Process Tapから得たシステム音声の強さ・帯域・音色・立ち上がり・周期性・ステレオの広がりを解析して、Work Louder Codex Microの外周LEDを動かすRustデーモンです。Apple Musicだけでなく、Spotifyやブラウザなど、MediaRemoteが現在の再生元として公開するアプリを同じ経路で扱います。
+Codex Micro Chroma is a local, audio-reactive lighting daemon for macOS, written in Rust. It extracts a representative colour from the artwork or thumbnail shown in macOS Now Playing and uses it to light the outer LED ring of the Work Louder Codex Micro.
 
-実行時にOpenAI/Codexのモデル、Spotify API、Apple Music API、外部サーバーは使用しません。モデルのトークン消費、APIキー、OAuth、SIPの無効化はいずれも不要です。
+It is not tied to Apple Music, Spotify, or any other service. Any music player, video player, or browser that publishes its current media and artwork through macOS Now Playing can use the same integration.
 
-## 構成
+Lighting effects and brightness respond dynamically to the audio's musical dynamics, frequency balance, timbre, transients, rhythmic pulse, and stereo width. Everything is processed on your Mac: there is no OpenAI or Codex model usage, no Spotify or Apple Music API, no API key, no OAuth flow, and no external server.
+
+## How it works
 
 ```text
 macOS Now Playing (Music / Spotify / browser / other players)
   -> macOS MediaRemote
-  -> Apple署名済み /usr/bin/perl + mediaremote-adapter
+  -> Apple-signed /usr/bin/perl + mediaremote-adapter
   -> media-remote Rust crate
-  -> ローカル画像デコード・代表色抽出
-  -> representative artwork color
+  -> local image decoding and representative-colour extraction
+  -> artwork colour
 
 macOS system output
   -> public Core Audio Process Tap
@@ -23,28 +25,34 @@ macOS system output
   -> Codex Micro v.oai.rgbcfg RPC
 ```
 
-MediaRemoteはAppleの非公開Frameworkです。macOS更新によって動作が変わる可能性があり、App Store配布向けの構成ではありません。再生元がNow Playingへサムネイルを公開しない場合、そのアプリから色は取得できません。
+MediaRemote is a private Apple framework. Its behaviour may change after a macOS update, and this architecture is not suitable for App Store distribution. If a player does not publish artwork to Now Playing, Codex Micro Chroma cannot derive a colour from it.
 
-## 必要条件
+## Requirements
 
-- macOS 14.2以降（reactive mode。`--mode static`はProcess Tap不要）
-- Now Playingへアートワークを公開する音楽・動画プレイヤー
-- 接続済みCodex Micro
-- Rust 1.88以降
+- macOS 14.2 or later for reactive mode; `--mode static` does not require a Process Tap
+- A music player, video player, or browser that publishes artwork to macOS Now Playing
+- A connected Work Louder Codex Micro
+- Rust 1.88 or later
 - Xcode Command Line Tools
-- macOS標準の `/usr/bin/perl`
+- The standard macOS `/usr/bin/perl`
 
-Codex Microを開くプロセスには、macOSの「プライバシーとセキュリティ > 入力監視」の許可が必要になる場合があります。`not permitted` が出た場合は、実行に使うTerminal、または `install` が表示する常駐ワーカーのパスを入力監視へ追加してください。
+## Compatibility and current status
 
-reactive modeの初回起動時にはmacOSの「画面収録とシステムオーディオ録音」（OSバージョンによっては「システムオーディオ録音」）許可が表示されます。音声は特徴量へ変換するだけで、録音・保存・ネットワーク送信しません。workerは許可されるまで同じプロセス内で再試行します。権限を使わない場合は `--mode static` を指定できます。
+The integration is service-agnostic, but artwork compatibility ultimately depends on each player publishing an image to macOS Now Playing. The browser/Helium path has been verified. Apple Music and Spotify artwork and colour output still require validation on the target Mac, as do long-running reconnect behaviour and final effect calibration on physical Codex Micro hardware.
 
-## ビルド
+Reactive analysis listens to the complete mixed macOS system output. If several applications play audio at once, the effects respond to that combined output while the base colour continues to come from the application selected by Now Playing.
+
+Exactly one HID interface matching the Codex Micro is required. No matching device, more than one matching interface, or missing Input Monitoring access leaves `run` waiting for the controller and causes one-shot commands such as `probe` or `set` to report an error.
+
+## Installation
+
+Build the release binary from the project root:
 
 ```bash
 cargo build --release
 ```
 
-## 動作確認
+Check the local MediaRemote and HID connections, inspect the current artwork colour, and verify system-audio analysis:
 
 ```bash
 ./target/release/codex-micro-chroma probe
@@ -52,47 +60,80 @@ cargo build --release
 ./target/release/codex-micro-chroma audio-probe --seconds 15
 ```
 
-HID経路だけを試す場合は、色とeffectを指定して点灯・消灯できます。`set`と`run`の既定effectは `breath` です。
+## Required user interaction and permissions
+
+macOS privacy permissions cannot be granted by the installer or from the command line. You must approve them in System Settings. Permissions are associated with the executable that requests access, so a command run from Terminal and the installed background worker may need separate approval.
+
+1. Connect one Codex Micro to the Mac.
+2. Run `./target/release/codex-micro-chroma probe`.
+3. If HID access is reported as `not permitted`, open **System Settings > Privacy & Security > Input Monitoring**, add and enable the terminal application you are using, then run `probe` again.
+4. Start some media so that macOS Now Playing contains a current item and artwork, then run `status`.
+5. Run `audio-probe --seconds 15` or start `run` in reactive mode. When macOS asks, approve **Screen & System Audio Recording**, or **System Audio Recording Only**, depending on your macOS version.
+
+The embedded `NSAudioCaptureUsageDescription` explains that system audio is analysed locally to animate the LED ring. Audio is converted into feature values in memory; it is never recorded, saved, or sent over the network.
+
+`run` retries HID access every two seconds until the device and Input Monitoring permission become available. In reactive mode it also retries the Process Tap every two seconds until System Audio Recording permission is available, so you do not normally need to restart it after granting access. `audio-probe`, `probe`, `status`, `set`, and `off` are one-shot commands; correct the permission or device problem and run the command again.
+
+Use `--mode static` if you do not want to grant system-audio access. Static mode still needs HID access and Now Playing artwork, but it does not start a Core Audio Process Tap.
+
+### Start automatically at login
+
+Install and start the per-user LaunchAgent:
 
 ```bash
-./target/release/codex-micro-chroma set --color '#33AAFF'
-./target/release/codex-micro-chroma set --color '#33AAFF' --effect snake
-./target/release/codex-micro-chroma off
+./target/release/codex-micro-chroma install
 ```
 
-## 対応effect
+The command copies the release binary into Application Support, gives it an ad-hoc signature with the fixed identifier `com.local.codex-micro-chroma`, and registers an Aqua-session LaunchAgent. The installed worker is located at:
 
-Codex Microで判明している次のeffectをすべて指定できます。
+```text
+~/Library/Application Support/CodexMicroChroma/codex-micro-chroma
+```
 
-| CLI名 | デバイス値 | reactive modeでの役割 |
-| --- | ---: | --- |
-| `off` | 0 | 一定時間の無音・停止 |
-| `solid` | 1 | 発話や中央に定位した直接的な音 |
-| `snake` | 2 | bass、pulse、周期性の強い場面 |
-| `rainbow` | 3 | 高音量・高flux・強いonsetが重なるclimax |
-| `breath` | 4 | 持続的・調性的で滑らかな音 |
-| `gradient` | 5 | ステレオの広がりが強い音 |
-| `shallow-breath` | 6 | quiet、intro、outro |
+If the system-audio permission prompt appears immediately after installation, grant it. If you dismiss it, add and enable the worker shown above in **System Settings > Privacy & Security > Screen & System Audio Recording**, then run `install` again.
 
-共通パラメータは `--brightness`、`--speed`、`--magic` で、いずれも0〜1です。effectごとの見え方や有効な組み合わせはデバイス実装に依存します。
+The LaunchAgent cannot approve its own privacy prompts. If the background worker is waiting, manually add and enable this installed executable for both permissions that are required on your Mac:
 
-## Now Playingへ追従
+- **Input Monitoring**, for Codex Micro HID access
+- **Screen & System Audio Recording** or **System Audio Recording Only**, for reactive audio analysis
+
+After changing a permission, check `~/Library/Logs/CodexMicroChroma/worker-error.log`. The worker normally resumes through its built-in retry loop. If macOS does not apply the change to the running worker, run `install` again to restart the LaunchAgent.
+
+An ad-hoc signature's designated requirement includes the binary's CDHash. After rebuilding and reinstalling, macOS may therefore ask you to approve Input Monitoring or System Audio Recording again. If necessary, switch the installed worker's permission off and on. A distribution build signed with a Developer ID or local code-signing certificate can avoid this repeated approval.
+
+Worker and track logs are stored in `~/Library/Logs/CodexMicroChroma/`.
+
+To stop the LaunchAgent and remove the installed copy:
+
+```bash
+~/Library/Application\ Support/CodexMicroChroma/codex-micro-chroma uninstall
+```
+
+`uninstall` removes the LaunchAgent plist and installed executable, but preserves diagnostic logs.
+
+## Usage
+
+### Follow the current media
+
+Start the default reactive mode:
 
 ```bash
 ./target/release/codex-micro-chroma run
 ```
 
-- 再生元またはコンテンツが変わると、新しいサムネイルを再解析します。
-- タイトルがない再生元もサムネイルfingerprintをcontent identityとして扱い、同じタイトル内で画像だけが変化した場合も追従します。
-- 白背景と透明ピクセルを除外し、支配的な色をLED向けに明るく鮮やかに補正します。
-- 新しいサムネイルを待つ間は、前コンテンツの色を消灯します。
-- 既定の `reactive` modeでは、相対音量をbrightness、複合的な運動性をspeed、音の広がり・変化をmagicへ反映します。
-- onset、flux、pulse、bassの短いイベントはattack/release envelopeで保持し、650msのcandidate dwellを通過できるようにします。僅差の候補はhysteresisで維持するため、beatが次のaudio frameで消えても`snake`などの動的effectへ到達します。
-- effectは2秒のminimum holdでちらつきを防ぎます。同じpatternが12秒を超えて最有力のままなら、意味的に近い次点へphrase-levelで譲り、`breath`など一種類への固着を防ぎます。`rainbow`には12秒のcooldownがあります。
-- effectごとにspeedとmagicのprofileを変え、`solid`は静止、`snake`はbeat駆動、`gradient`はstereo width、`rainbow`はclimax、2種類のbreathは異なる深さとして送信します。短い休符では消灯しません。
-- HIDは一度開いた接続を再利用し、既定100ms間隔で更新します。起動時にデバイスまたは入力監視権限が未準備ならworkerを終了せず待機し、切断・response timeoutなどのtransport errorでは一度だけ自動再接続します。
-- 再生中にProcess Tapのframeが3秒停止するか、完全なゼロframeが15秒続いた場合は、30秒のcooldownを設けてTapとaggregate deviceを再生成します。
-- Control-CまたはSIGTERMで停止するとLEDを消灯します。
+- When the player or media changes, the new artwork is analysed automatically.
+- A thumbnail fingerprint is used as the content identity when no title is available, and artwork changes are detected even when the title remains the same.
+- White backgrounds and transparent pixels are excluded before the dominant colour is adjusted to be brighter and more vivid on the LEDs.
+- The previous media colour is cleared while new artwork is pending.
+- Relative loudness controls brightness, combined musical motion controls speed, and spatial width and change control the device's `magic` parameter.
+- Brief onset, flux, pulse, and bass events are held with attack-and-release envelopes so that they can pass the 650 ms candidate dwell. Hysteresis preserves close-scoring candidates, allowing a beat to trigger a dynamic effect such as `snake` even if it has disappeared by the next audio frame.
+- Effects have a two-second minimum hold to prevent flicker. If the same pattern remains the strongest candidate for more than 12 seconds, a semantically close runner-up may take over at a phrase boundary to avoid becoming stuck on a single effect such as `breath`. `rainbow` has a 12-second cooldown.
+- Speed and `magic` use effect-specific profiles: `solid` remains still, `snake` follows the beat, `gradient` reflects stereo width, `rainbow` marks a climax, and the two breathing effects use different depths. A brief rest does not switch the ring off.
+- A persistent HID connection is reused and updated every 100 ms by default. If the device or Input Monitoring permission is unavailable at start-up, the worker waits rather than exiting. It automatically reconnects once after a disconnection, response timeout, or other transport failure.
+- If Process Tap frames stop for three seconds during playback, or remain completely zero-filled for 15 seconds, the tap and aggregate device are rebuilt with a 30-second recovery cooldown.
+- Control-C or SIGTERM stops the process and switches the LEDs off.
+
+The default values can be set explicitly:
 
 ```bash
 ./target/release/codex-micro-chroma run \
@@ -102,7 +143,7 @@ Codex Microで判明している次のeffectをすべて指定できます。
   --device-ms 100
 ```
 
-従来どおり一つのeffectを固定する場合:
+To follow artwork while keeping one fixed effect:
 
 ```bash
 ./target/release/codex-micro-chroma run \
@@ -114,64 +155,79 @@ Codex Microで判明している次のeffectをすべて指定できます。
   --refresh-ms 750
 ```
 
-`audio-probe`はLEDへ書き込まず、Process Tapから計算した `AudioFeatureFrame` をJSON Linesで表示します。アルゴリズム調整や権限確認に使用できます。
+### Test the lighting directly
 
-## 1曲単位のeffect log
+Set a colour without reading Now Playing, then switch the lighting off. The default effect for both `set` and `run` is `breath`.
 
-`run`はNow Playingの`elapsed_time`、`duration`、`playback_rate`を追跡し、曲ごとのJSON Linesを次へ自動保存します。
+```bash
+./target/release/codex-micro-chroma set --color '#33AAFF'
+./target/release/codex-micro-chroma set --color '#33AAFF' --effect snake
+./target/release/codex-micro-chroma off
+```
+
+`off` clears both the key lighting and ambient-ring lighting controlled by this tool.
+
+### Inspect audio features
+
+`audio-probe` does not write to the LEDs. It prints `AudioFeatureFrame` values calculated from the Process Tap as JSON Lines, which is useful for permission checks and algorithm tuning.
+
+```bash
+./target/release/codex-micro-chroma audio-probe --seconds 15
+```
+
+## Lighting effects
+
+All currently known Codex Micro effects can be selected.
+
+| CLI name | Device value | Role in reactive mode |
+| --- | ---: | --- |
+| `off` | 0 | Sustained silence or stopped playback |
+| `solid` | 1 | Speech or direct, centre-panned sound |
+| `snake` | 2 | Strong bass, pulse, or rhythmic periodicity |
+| `rainbow` | 3 | A climax combining high level, strong flux, and pronounced onsets |
+| `breath` | 4 | Smooth, sustained, tonal material |
+| `gradient` | 5 | Wide stereo material |
+| `shallow-breath` | 6 | Quiet passages, introductions, and outros |
+
+The shared `--brightness`, `--speed`, and `--magic` parameters each accept values from 0 to 1. Their visible behaviour and useful combinations depend on the device firmware's implementation of each effect.
+
+## Per-track effect logs
+
+`run` follows the Now Playing `elapsed_time`, `duration`, and `playback_rate` values and automatically writes one JSON Lines log per track:
 
 ```text
 ~/Library/Logs/CodexMicroChroma/tracks/<timestamp>-<title>.jsonl
 ```
 
-- `track_start`: 曲、再生元、尺、観測開始位置
-- `effect_transition`: 曲内位置、effect、色、brightness、speed、magic、その時点の全audio feature
-- `track_summary`: effect別の秒数と比率、遷移回数、観測時間、終了理由
+- `track_start`: media metadata, source application, duration, and observed starting position
+- `effect_transition`: position, effect, colour, brightness, speed, `magic`, and all audio features at that moment
+- `track_summary`: time and percentage per effect, transition count, observed time, and completion reason
 
-開始位置が2秒以内、終了位置が曲末2秒以内、かつ曲尺の85%以上を実際に観測した場合だけ`complete_track`が`true`になります。一時停止中は集計を止め、同じ曲の再開時は同じlogを継続します。同じ曲がリピートまたはクロスフェードで先頭5秒以内へ大きく巻き戻った場合は、前周を`position_restarted`で確定して次周を別logへ分割します。この場合も曲尺の85%以上を観測していれば完全な1曲として扱います。各recordは遷移時にflushされるため、再生中でも`tail -f`で監視できます。
+`complete_track` is `true` only when observation began within the first two seconds, ended within the final two seconds, and covered at least 85% of the media's duration. Accounting pauses with playback and resumes in the same log when the same media continues.
 
-MediaRemoteの経過時間は受信イベントをローカルの単調時計へアンカーして追跡します。これにより、長時間の一時停止後に古いMediaRemote timestampが返る場合でも、停止時間を曲の経過時間へ誤加算しません。
+If a repeat or crossfade causes the position to jump backwards to within the first five seconds, the current pass is finalised with `position_restarted` and the next pass is written to a separate log. The previous pass still counts as complete if at least 85% of its duration was observed. Records are flushed on every transition, so a live log can be inspected with `tail -f`.
 
-## ログイン時に自動起動
+MediaRemote elapsed time is anchored to a local monotonic clock when each event arrives. This prevents time spent paused from being added to the media position if MediaRemote returns an old timestamp after a long pause.
 
-releaseバイナリ自身をユーザーのApplication Supportへ一時コピーし、固定identifier `com.local.codex-micro-chroma` でad-hoc署名してからatomic renameし、Aquaセッション限定のLaunchAgentを登録します。
+## Privacy and security
 
-```bash
-./target/release/codex-micro-chroma install
-```
+- No OpenAI, Codex, Spotify, Apple Music, or other external API is used.
+- No network connection is made at runtime.
+- System Integrity Protection is not changed.
+- Root access, `sudo`, and code injection are not used.
+- Process Tap PCM is not written to a file.
+- Playback is observed but never controlled.
+- HID access opens exactly one interface matching the Codex Micro VID, PID, and usage page.
+- An inter-process lock serialises concurrent LED writes.
+- The installed worker uses a fixed identifier and an ad-hoc signature, not a Developer ID certificate.
 
-初回install直後にシステムオーディオ許可が表示された場合は許可してください。許可しなかった場合は、システム設定から次のworkerを「画面収録とシステムオーディオ録音」へ追加・有効化してから再度installします。
+## Implementation notes
 
-```text
-~/Library/Application Support/CodexMicroChroma/codex-micro-chroma
-```
+`CATapDescription` is an Objective-C API, so only Process Tap and aggregate-device creation and destruction are isolated in a small Objective-C bridge. After the bridge delivers Float32 PCM, the FFT, feature extraction, relative normalisation, effect scoring, state transitions, and HID control are implemented in Rust.
 
-ad-hoc署名のdesignated requirementはバイナリのCDHashを含むため、ソース変更後に再build・再installした場合、macOSが入力監視またはシステムオーディオ録音の再承認を求めることがあります。その場合は上記workerのスイッチを一度OFF/ONにしてください。workerは入力監視が許可されるまで同じプロセス内で待機します。Developer IDまたはローカルのCode Signing証明書で署名する配布構成では、この再承認を避けられます。
+The audio callback sends fixed-size packets to a bounded channel with `try_send`; FFT work and locking never run on Core Audio's real-time thread.
 
-ログは `~/Library/Logs/CodexMicroChroma/` に保存されます。停止・削除:
-
-```bash
-~/Library/Application\ Support/CodexMicroChroma/codex-micro-chroma uninstall
-```
-
-`uninstall` はLaunchAgentのplistとコピーした実行ファイルだけを削除し、診断用ログは残します。
-
-## セキュリティ境界
-
-- SIPを変更しません。
-- root、`sudo`、コード注入を使用しません。
-- ネットワークへ接続しません。
-- Process TapのPCMをファイルへ保存しません。
-- 再生操作を行いません。
-- HIDはCodex MicroのVID/PID/usage pageが完全一致するインターフェースを1台だけ開きます。
-- プロセス間ロックで同時LED書き込みを直列化します。
-- installed workerは固定identifierで署名しますが、Developer ID証明書は使用しません。
-
-## 実装上の境界
-
-`CATapDescription`はAppleのObjective-C APIであるため、Tapとaggregate deviceの生成・破棄だけを小さなObjective-C bridgeへ隔離しています。受け取ったFloat32 PCM以降のFFT、特徴抽出、相対正規化、effect score、状態遷移、HID制御はRustです。audio callbackは固定長packetをbounded channelへ `try_send` し、FFTやロックをCore Audioのreal-time thread上で実行しません。
-
-## 開発時の確認
+## Development
 
 ```bash
 cargo fmt --all --check
@@ -179,6 +235,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-## ライセンス
+## Licence and credits
 
-このプロジェクトはMIT Licenseです。MediaRemote Adapterおよび参照したCodex Micro HID実装の帰属は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照してください。
+Codex Micro Chroma is available under the [MIT Licence](LICENSE).
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution for MediaRemote Adapter, the referenced Codex Micro HID implementations, and the Core Audio Process Tap reference.
