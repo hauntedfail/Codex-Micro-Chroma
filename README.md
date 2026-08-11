@@ -11,8 +11,8 @@ Lighting effects and brightness respond dynamically to the audio's musical dynam
 ```text
 macOS Now Playing (Music / Spotify / browser / other players)
   -> macOS MediaRemote
-  -> Apple-signed /usr/bin/perl + mediaremote-adapter
-  -> media-remote Rust crate
+  -> Apple-signed /usr/bin/perl + embedded per-player session adapter
+  -> active-session arbitration from macOS-owned state
   -> local image decoding and representative-colour extraction
   -> artwork colour
 
@@ -27,6 +27,8 @@ macOS system output
 
 MediaRemote is a private Apple framework. Its behaviour may change after a macOS update, and this architecture is not suitable for App Store distribution. If a player does not publish artwork to Now Playing, Codex Micro Chroma cannot derive a colour from it.
 
+When several applications publish Now Playing sessions simultaneously, Codex Micro Chroma enumerates the current OS sessions on every refresh and considers only sessions that macOS reports as playing. The session with the newest macOS `lastPlayingDate` wins; the OS-elected Now Playing session breaks equal or unavailable-date ties, followed by a stable identifier for deterministic output. No separate playback-order history is persisted by this application. If the selected session stops, its lighting is cleared and the next still-playing session is selected from that same OS snapshot. If none remains, lighting stays off.
+
 ## Requirements
 
 - macOS 14.2 or later for reactive mode; `--mode static` does not require a Process Tap
@@ -40,7 +42,7 @@ MediaRemote is a private Apple framework. Its behaviour may change after a macOS
 
 The integration is service-agnostic, but artwork compatibility ultimately depends on each player publishing an image to macOS Now Playing. The browser/Helium path has been verified. Apple Music and Spotify artwork and colour output still require validation on the target Mac, as do long-running reconnect behaviour and final effect calibration on physical Codex Micro hardware.
 
-Reactive analysis listens to the complete mixed macOS system output. If several applications play audio at once, the effects respond to that combined output while the base colour continues to come from the application selected by Now Playing.
+Reactive analysis listens to the complete mixed macOS system output. If several applications play audio at once, the effects respond to that combined output while the base colour comes from the active session selected by the arbitration above.
 
 Exactly one HID interface matching the Codex Micro is required. No matching device, more than one matching interface, or missing Input Monitoring access leaves `run` waiting for the controller and causes one-shot commands such as `probe` or `set` to report an error.
 
