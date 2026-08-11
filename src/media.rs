@@ -7,6 +7,9 @@ pub struct TrackSnapshot {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub bundle_id: Option<String>,
+    pub elapsed_time: Option<f64>,
+    pub duration: Option<f64>,
+    pub playback_rate: Option<f64>,
     pub artwork: Option<DynamicImage>,
     pub artwork_signature: Option<u64>,
 }
@@ -124,6 +127,9 @@ mod platform {
                 artist: info.artist.clone(),
                 album: info.album.clone(),
                 bundle_id: info.bundle_id.clone(),
+                elapsed_time: info.elapsed_time,
+                duration: info.duration,
+                playback_rate: info.playback_rate,
                 artwork: None,
                 artwork_signature: info.album_cover.as_ref().map(artwork_signature),
             };
@@ -198,6 +204,9 @@ mod tests {
             artist: Some("Artist".into()),
             album: Some("Album".into()),
             bundle_id: bundle_id.map(str::to_owned),
+            elapsed_time: Some(0.0),
+            duration: Some(180.0),
+            playback_rate: Some(1.0),
             artwork: None,
             artwork_signature: None,
         }

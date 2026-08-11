@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use serde::Serialize;
+
 use crate::{audio::AudioFeatureFrame, color::Rgb, protocol::LightingEffect};
 
 const EFFECT_DWELL: Duration = Duration::from_millis(650);
@@ -10,7 +12,7 @@ const RAINBOW_COOLDOWN: Duration = Duration::from_secs(12);
 const CANDIDATE_SCORE_MARGIN: f32 = 0.24;
 const VARIETY_SCORE_MARGIN: f32 = 0.28;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct LightingScene {
     pub effect: LightingEffect,
     pub color: Rgb,

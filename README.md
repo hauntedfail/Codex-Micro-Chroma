@@ -116,6 +116,20 @@ Codex Microで判明している次のeffectをすべて指定できます。
 
 `audio-probe`はLEDへ書き込まず、Process Tapから計算した `AudioFeatureFrame` をJSON Linesで表示します。アルゴリズム調整や権限確認に使用できます。
 
+## 1曲単位のeffect log
+
+`run`はNow Playingの`elapsed_time`、`duration`、`playback_rate`を追跡し、曲ごとのJSON Linesを次へ自動保存します。
+
+```text
+~/Library/Logs/CodexMicroChroma/tracks/<timestamp>-<title>.jsonl
+```
+
+- `track_start`: 曲、再生元、尺、観測開始位置
+- `effect_transition`: 曲内位置、effect、色、brightness、speed、magic、その時点の全audio feature
+- `track_summary`: effect別の秒数と比率、遷移回数、観測時間、終了理由
+
+開始位置が2秒以内、終了位置が曲末2秒以内、かつ曲尺の85%以上を実際に観測した場合だけ`complete_track`が`true`になります。一時停止中は集計を止め、同じ曲の再開時は同じlogを継続します。各recordは遷移時にflushされるため、再生中でも`tail -f`で監視できます。
+
 ## ログイン時に自動起動
 
 releaseバイナリ自身をユーザーのApplication Supportへ一時コピーし、固定identifier `com.local.codex-micro-chroma` でad-hoc署名してからatomic renameし、Aquaセッション限定のLaunchAgentを登録します。

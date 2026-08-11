@@ -18,6 +18,7 @@ use codex_micro_chroma::{
     protocol::LightingEffect,
     service,
     system_audio::SystemAudioSource,
+    telemetry::{default_track_log_directory, FinishedTrack, TrackLogger},
 };
 
 static NEXT_REQUEST_ID: AtomicU16 = AtomicU16::new(1);
@@ -260,6 +261,12 @@ fn run(arguments: RunArgs) -> Result<()> {
         return Ok(());
     };
     let source = MediaRemoteSource::new()?;
+    let track_log_directory = default_track_log_directory()
+        .context("could not locate the per-track effect log directory")?;
+    let mut track_logger = Some(
+        TrackLogger::new(&track_log_directory)
+            .context("could not initialize per-track effect logging")?,
+    );
     let mut audio = match arguments.mode {
         RunMode::Reactive => {
             let Some(source) = wait_for_audio_source(&running) else {
@@ -305,7 +312,17 @@ fn run(arguments: RunArgs) -> Result<()> {
         if Instant::now() >= next_media_poll {
             next_media_poll = Instant::now() + poll_interval;
             if let Some(snapshot) = source.snapshot() {
+                let snapshot_key = snapshot.track_key();
+                if let (Some(logger), Some(key)) = (track_logger.as_mut(), snapshot_key.as_deref())
+                {
+                    if logger.active_key() == Some(key) {
+                        logger.update_snapshot(&snapshot);
+                    }
+                }
                 if snapshot.is_playing == Some(false) {
+                    if snapshot_reached_end(&snapshot) {
+                        finish_track_log(&mut track_logger, "ended");
+                    }
                     playback_active = false;
                     zero_audio_since = None;
                     source.invalidate_artwork_delivery();
@@ -327,8 +344,9 @@ fn run(arguments: RunArgs) -> Result<()> {
                         zero_audio_since = None;
                     }
                     playback_active = true;
-                    if let Some(key) = snapshot.track_key() {
+                    if let Some(key) = snapshot_key {
                         if observed_key.as_deref() != Some(&key) {
+                            start_track_log(&mut track_logger, &key, &snapshot);
                             observed_key = Some(key.clone());
                             current_key = None;
                             composer = None;
@@ -407,6 +425,12 @@ fn run(arguments: RunArgs) -> Result<()> {
                         scene.brightness =
                             (scene.brightness * arguments.brightness).clamp(0.0, 1.0);
                         current_scene = Some(scene);
+                        if let Some(logger) = track_logger.as_mut() {
+                            if let Err(error) = logger.observe_scene(scene, frame, elapsed) {
+                                eprintln!("Track effect logging failed and was disabled: {error}");
+                                track_logger = None;
+                            }
+                        }
                         if last_effect != Some(scene.effect) {
                             println!(
                                 "Audio scene -> {} (brightness {:.2}, speed {:.2}, magic {:.2})",
@@ -475,6 +499,7 @@ fn run(arguments: RunArgs) -> Result<()> {
         thread::sleep(Duration::from_millis(20));
     }
 
+    finish_track_log(&mut track_logger, "stopped");
     controller
         .clear(next_request_id())
         .context("stopped, but the Codex Micro ring could not be cleared")?;
@@ -590,6 +615,93 @@ fn print_snapshot(snapshot: &TrackSnapshot) {
         snapshot.artist.as_deref().unwrap_or("unknown")
     );
     println!("Album: {}", snapshot.album.as_deref().unwrap_or("unknown"));
+    if let Some(elapsed) = snapshot.elapsed_time {
+        println!("Elapsed: {elapsed:.1}s");
+    }
+    if let Some(duration) = snapshot.duration {
+        println!("Duration: {duration:.1}s");
+    }
+}
+
+fn start_track_log(logger: &mut Option<TrackLogger>, key: &str, snapshot: &TrackSnapshot) {
+    let Some(active) = logger.as_mut() else {
+        return;
+    };
+    if active.active_key() == Some(key) {
+        active.update_snapshot(snapshot);
+        return;
+    }
+    match active.finish("track_changed") {
+        Ok(Some(finished)) => print_finished_track(&finished),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("Could not finish the previous track effect log: {error}");
+            *logger = None;
+            return;
+        }
+    }
+    match active.start_track(key, snapshot) {
+        Ok(path) => println!(
+            "Track effect log started at {:.1}/{:.1}s: {}",
+            snapshot.elapsed_time.unwrap_or(0.0),
+            snapshot.duration.unwrap_or(0.0),
+            path.display()
+        ),
+        Err(error) => {
+            eprintln!("Track effect logging failed and was disabled: {error}");
+            *logger = None;
+        }
+    }
+}
+
+fn finish_track_log(logger: &mut Option<TrackLogger>, reason: &str) {
+    let Some(active) = logger.as_mut() else {
+        return;
+    };
+    match active.finish(reason) {
+        Ok(Some(finished)) => print_finished_track(&finished),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("Could not finish the track effect log: {error}");
+            *logger = None;
+        }
+    }
+}
+
+fn print_finished_track(finished: &FinishedTrack) {
+    let usage = finished
+        .summary
+        .effect_usage
+        .iter()
+        .filter(|usage| usage.seconds >= 0.01)
+        .map(|usage| {
+            format!(
+                "{} {:.1}s/{:.1}%",
+                usage.effect, usage.seconds, usage.percent
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "Track effect log finished (complete={}, observed {:.1}s, transitions {}): {} [{}]",
+        finished.summary.complete_track,
+        finished.summary.observed_seconds,
+        finished.summary.transitions,
+        finished.path.display(),
+        usage
+    );
+}
+
+fn snapshot_reached_end(snapshot: &TrackSnapshot) -> bool {
+    snapshot
+        .elapsed_time
+        .zip(snapshot.duration)
+        .is_some_and(|(elapsed, duration)| {
+            elapsed.is_finite()
+                && duration.is_finite()
+                && duration > 0.0
+                && elapsed >= duration - 2.0
+        })
 }
 
 fn next_request_id() -> u16 {

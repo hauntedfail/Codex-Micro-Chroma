@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
 use image::{DynamicImage, GenericImageView};
+use serde::Serialize;
 use thiserror::Error;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct Rgb {
     pub red: u8,
     pub green: u8,

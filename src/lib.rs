@@ -6,3 +6,4 @@ pub mod media;
 pub mod protocol;
 pub mod service;
 pub mod system_audio;
+pub mod telemetry;

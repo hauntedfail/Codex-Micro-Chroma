@@ -16,7 +16,8 @@ pub enum ProtocolError {
     Json(#[from] serde_json::Error),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 #[repr(u8)]
 pub enum LightingEffect {
     Off = 0,
