@@ -9,12 +9,21 @@ typedef void (*MRGetPlayerForClient)(id, id, dispatch_queue_t, void (^)(id));
 typedef void (*MRGetInfoForPlayer)(id, BOOL, dispatch_queue_t,
                                    void (^)(NSDictionary *));
 
+@interface MRPlayerPath : NSObject
+- (instancetype)initWithOrigin:(id)origin client:(id)client player:(id)player;
+@end
+
+@interface MRNowPlayingRequest : NSObject
+- (instancetype)initWithPlayerPath:(id)playerPath;
+@end
+
 static MRGetNowPlayingClients getNowPlayingClients;
 static MRGetPlayerForClient getPlayerForClient;
 static MRGetInfoForPlayer getInfoForPlayer;
 static dispatch_queue_t requestQueue;
 static BOOL refreshInFlight = NO;
 static NSData *previousPayloadData = nil;
+static NSMutableDictionary<NSString *, NSDictionary *> *artworkCache = nil;
 
 static id objectProperty(id object, NSString *selectorName) {
     SEL selector = NSSelectorFromString(selectorName);
@@ -36,7 +45,33 @@ static long integerProperty(id object, NSString *selectorName, BOOL *present) {
         return 0;
     }
     *present = YES;
-    return ((long(*)(id, SEL))objc_msgSend)(object, selector);
+    return (long)((int (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static NSString *cachedArtworkData(NSString *stableID, NSData *artwork) {
+    if (!stableID || !artwork) {
+        return nil;
+    }
+    NSDictionary *cached = artworkCache[stableID];
+    NSData *cachedData = cached[@"data"];
+    NSString *cachedEncoded = cached[@"encoded"];
+    if ([cachedData isKindOfClass:[NSData class]] &&
+        [cachedEncoded isKindOfClass:[NSString class]] &&
+        [cachedData isEqualToData:artwork]) {
+        return cachedEncoded;
+    }
+
+    NSString *encoded = [artwork base64EncodedStringWithOptions:0];
+    artworkCache[stableID] = @{ @"data" : [artwork copy], @"encoded" : encoded };
+    return encoded;
+}
+
+static void pruneArtworkCache(NSSet<NSString *> *activeStableIDs) {
+    for (NSString *stableID in [artworkCache.allKeys copy]) {
+        if (![activeStableIDs containsObject:stableID]) {
+            [artworkCache removeObjectForKey:stableID];
+        }
+    }
 }
 
 static void copyString(NSMutableDictionary *destination, NSString *outputKey,
@@ -86,24 +121,31 @@ static void refreshSessions(void) {
 
     dispatch_queue_t queue = dispatch_get_main_queue();
     NSMutableArray *candidates = [NSMutableArray array];
+    NSMutableSet<NSString *> *activeStableIDs = [NSMutableSet set];
     Class playerPathClass = NSClassFromString(@"MRPlayerPath");
     Class requestClass = NSClassFromString(@"MRNowPlayingRequest");
     id electedPath = objectProperty(requestClass, @"localNowPlayingPlayerPath");
     __block BOOL completed = NO;
+    __block BOOL refreshValid = YES;
 
-    void (^complete)(void) = ^{
+    void (^complete)(BOOL) = ^(BOOL timedOut) {
       if (completed) {
           return;
       }
       completed = YES;
-      printCandidates(candidates);
+      if (!timedOut && refreshValid) {
+          printCandidates(candidates);
+          pruneArtworkCache(activeStableIDs);
+      }
       refreshInFlight = NO;
       scheduleRefresh();
     };
 
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
-        queue, complete);
+        queue, ^{
+          complete(YES);
+        });
 
     getNowPlayingClients(queue, ^(id clientsValue) {
         if (completed) {
@@ -117,15 +159,19 @@ static void refreshSessions(void) {
         for (id client in clients) {
             dispatch_group_enter(group);
             getPlayerForClient(client, nil, queue, ^(id player) {
+                if (completed) {
+                    dispatch_group_leave(group);
+                    return;
+                }
                 if (!player || !playerPathClass) {
                     dispatch_group_leave(group);
                     return;
                 }
 
-                id playerPath = ((id(*)(id, SEL, id, id, id))objc_msgSend)(
-                    [playerPathClass alloc],
-                    NSSelectorFromString(@"initWithOrigin:client:player:"), nil,
-                    client, player);
+                MRPlayerPath *playerPath =
+                    [[(id)playerPathClass alloc] initWithOrigin:nil
+                                                         client:client
+                                                         player:player];
                 if (!playerPath) {
                     dispatch_group_leave(group);
                     return;
@@ -146,9 +192,10 @@ static void refreshSessions(void) {
                                                                       bundleID,
                                                                       playerID,
                                                                       processIdentifier]
-                                         : [NSString stringWithFormat:@"%@:%@",
-                                                                      bundleID,
-                                                                      playerID];
+                                          : [NSString stringWithFormat:@"%@:%@",
+                                                                       bundleID,
+                                                                       playerID];
+                [activeStableIDs addObject:stableID];
                 NSMutableDictionary *entry = [@{
                     @"stableId" : stableID,
                     @"bundleId" : bundleID,
@@ -158,12 +205,10 @@ static void refreshSessions(void) {
                 } mutableCopy];
                 [candidates addObject:entry];
 
-                id request = requestClass
-                                 ? ((id(*)(id, SEL, id))objc_msgSend)(
-                                       [requestClass alloc],
-                                       NSSelectorFromString(@"initWithPlayerPath:"),
-                                       playerPath)
-                                 : nil;
+                MRNowPlayingRequest *request =
+                    requestClass
+                        ? [[(id)requestClass alloc] initWithPlayerPath:playerPath]
+                        : nil;
                 SEL isPlayingSelector = NSSelectorFromString(
                     @"requestIsPlayingOnQueue:completion:");
                 BOOL supportsScopedPlaying =
@@ -172,6 +217,10 @@ static void refreshSessions(void) {
                 dispatch_group_enter(group);
                 getInfoForPlayer(playerPath, YES, queue,
                                  ^(NSDictionary *information) {
+                  if (completed) {
+                      dispatch_group_leave(group);
+                      return;
+                  }
                   if ([information isKindOfClass:[NSDictionary class]]) {
                       copyString(entry, @"title", information,
                                  @"kMRMediaRemoteNowPlayingInfoTitle");
@@ -199,8 +248,11 @@ static void refreshSessions(void) {
                       id artwork = information[
                           @"kMRMediaRemoteNowPlayingInfoArtworkData"];
                       if ([artwork isKindOfClass:[NSData class]]) {
-                          entry[@"artworkData"] =
-                              [(NSData *)artwork base64EncodedStringWithOptions:0];
+                          NSString *encoded =
+                              cachedArtworkData(stableID, (NSData *)artwork);
+                          if (encoded) {
+                              entry[@"artworkData"] = encoded;
+                          }
                       }
                   }
                   dispatch_group_leave(group);
@@ -215,8 +267,16 @@ static void refreshSessions(void) {
                             ^(BOOL playing, NSError *error) {
                               (void)request;
                               dispatch_async(queue, ^{
-                                entry[@"playing"] = @(error == nil && playing);
-                                entry[@"playingResolved"] = @YES;
+                                if (completed) {
+                                    dispatch_group_leave(group);
+                                    return;
+                                }
+                                if (error) {
+                                    refreshValid = NO;
+                                } else {
+                                    entry[@"playing"] = @(playing);
+                                    entry[@"playingResolved"] = @YES;
+                                }
                                 dispatch_group_leave(group);
                               });
                             });
@@ -233,6 +293,10 @@ static void refreshSessions(void) {
                               (void)request;
                               (void)error;
                               dispatch_async(queue, ^{
+                                if (completed) {
+                                    dispatch_group_leave(group);
+                                    return;
+                                }
                                 if ([date isKindOfClass:[NSDate class]]) {
                                     entry[@"lastPlayingDate"] =
                                         @([date timeIntervalSince1970]);
@@ -247,7 +311,9 @@ static void refreshSessions(void) {
             });
         }
 
-        dispatch_group_notify(group, queue, complete);
+        dispatch_group_notify(group, queue, ^{
+          complete(NO);
+        });
     });
 }
 
@@ -280,6 +346,7 @@ __attribute__((visibility("default"))) void chroma_media_sessions_stream(void) {
         }
         requestQueue = dispatch_queue_create(
             "com.local.codex-micro-chroma.media-sessions", DISPATCH_QUEUE_SERIAL);
+        artworkCache = [NSMutableDictionary dictionary];
 
         Class requestClass = NSClassFromString(@"MRNowPlayingRequest");
         if (!requestClass ||

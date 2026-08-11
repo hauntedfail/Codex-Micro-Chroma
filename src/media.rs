@@ -1,8 +1,13 @@
-use image::{DynamicImage, GenericImageView};
+use image::DynamicImage;
+#[cfg(any(target_os = "macos", test))]
+use image::GenericImageView;
+#[cfg(any(target_os = "macos", test))]
 use serde::Deserialize;
 
+#[cfg(any(target_os = "macos", test))]
 const POSITION_EDGE_TOLERANCE_SECONDS: f64 = 2.0;
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PlaybackCandidate {
@@ -34,6 +39,7 @@ struct PlaybackCandidate {
     artwork_data: Option<String>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn select_playback_candidate(candidates: &[PlaybackCandidate]) -> Option<&PlaybackCandidate> {
     candidates
         .iter()
@@ -62,6 +68,22 @@ pub struct TrackSnapshot {
 }
 
 impl TrackSnapshot {
+    #[cfg(any(target_os = "macos", test))]
+    fn clone_without_artwork(&self) -> Self {
+        Self {
+            is_playing: self.is_playing,
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+            album: self.album.clone(),
+            bundle_id: self.bundle_id.clone(),
+            elapsed_time: self.elapsed_time,
+            duration: self.duration,
+            playback_rate: self.playback_rate,
+            artwork: None,
+            artwork_signature: self.artwork_signature,
+        }
+    }
+
     pub fn track_key(&self) -> Option<String> {
         let bundle_id = normalized(self.bundle_id.as_deref());
         let title = normalized(self.title.as_deref());
@@ -89,6 +111,7 @@ fn normalized(value: Option<&str>) -> &str {
     value.map(str::trim).unwrap_or_default()
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn artwork_signature(image: &DynamicImage) -> u64 {
     let (width, height) = image.dimensions();
     let mut hash = 0xcbf29ce484222325_u64;
@@ -110,6 +133,7 @@ fn artwork_signature(image: &DynamicImage) -> u64 {
     hash
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn position_at_reception(
     elapsed: Option<f64>,
     duration: Option<f64>,
@@ -146,10 +170,12 @@ fn position_at_reception(
 }
 
 #[derive(Default)]
+#[cfg(any(target_os = "macos", test))]
 struct ArtworkDelivery {
     last_key: Option<String>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl ArtworkDelivery {
     fn should_deliver(&mut self, key: Option<&str>, artwork_available: bool) -> bool {
         let Some(key) = key.filter(|_| artwork_available) else {
@@ -210,6 +236,9 @@ mod platform {
     impl ReceivedNowPlaying {
         fn from_candidate(candidate: Option<&PlaybackCandidate>, previous: Option<&Self>) -> Self {
             let received_at = Instant::now();
+            if candidate.is_none() {
+                return Self::stopped_from_previous(previous, received_at);
+            }
             let artwork = candidate
                 .and_then(|candidate| candidate.artwork_data.as_deref())
                 .and_then(|encoded| general_purpose::STANDARD.decode(encoded).ok())
@@ -257,6 +286,33 @@ mod platform {
             }
         }
 
+        fn stopped_from_previous(previous: Option<&Self>, received_at: Instant) -> Self {
+            let mut snapshot = previous.map_or_else(
+                || TrackSnapshot {
+                    is_playing: Some(false),
+                    title: None,
+                    artist: None,
+                    album: None,
+                    bundle_id: None,
+                    elapsed_time: None,
+                    duration: None,
+                    playback_rate: None,
+                    artwork: None,
+                    artwork_signature: None,
+                },
+                |previous| previous.snapshot.clone_without_artwork(),
+            );
+            snapshot.is_playing = Some(false);
+            snapshot.artwork = None;
+            let position_at_received = previous.and_then(Self::elapsed_time);
+            snapshot.elapsed_time = position_at_received;
+            Self {
+                snapshot,
+                position_at_received,
+                received_at,
+            }
+        }
+
         fn elapsed_time(&self) -> Option<f64> {
             let rate = self
                 .snapshot
@@ -283,6 +339,18 @@ mod platform {
             && left.title == right.title
             && left.artist == right.artist
             && left.album == right.album
+    }
+
+    fn publish_stopped(
+        latest: &RwLock<Option<ReceivedNowPlaying>>,
+        reason: &str,
+    ) -> std::io::Result<()> {
+        let mut latest = latest
+            .write()
+            .map_err(|_| std::io::Error::other("MediaRemote state lock is poisoned"))?;
+        *latest = Some(ReceivedNowPlaying::from_candidate(None, latest.as_ref()));
+        eprintln!("MediaRemote session helper stopped: {reason}; clearing Now Playing state");
+        Ok(())
     }
 
     pub struct MediaRemoteSource {
@@ -325,16 +393,32 @@ mod platform {
             let latest = Arc::new(RwLock::new(None::<ReceivedNowPlaying>));
             let reader_latest = Arc::clone(&latest);
             let reader = thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    let Ok(payload) = serde_json::from_str::<SessionPayload>(&line) else {
-                        continue;
-                    };
-                    let selected = select_playback_candidate(&payload.candidates);
-                    if let Ok(mut latest) = reader_latest.write() {
-                        *latest = Some(ReceivedNowPlaying::from_candidate(
-                            selected,
-                            latest.as_ref(),
-                        ));
+                let mut lines = BufReader::new(stdout).lines();
+                loop {
+                    match lines.next() {
+                        Some(Ok(line)) => {
+                            let Ok(payload) = serde_json::from_str::<SessionPayload>(&line) else {
+                                continue;
+                            };
+                            let selected = select_playback_candidate(&payload.candidates);
+                            if let Ok(mut latest) = reader_latest.write() {
+                                *latest = Some(ReceivedNowPlaying::from_candidate(
+                                    selected,
+                                    latest.as_ref(),
+                                ));
+                            }
+                        }
+                        Some(Err(error)) => {
+                            let _ = publish_stopped(
+                                &reader_latest,
+                                &format!("stdout read error: {error}"),
+                            );
+                            break;
+                        }
+                        None => {
+                            let _ = publish_stopped(&reader_latest, "stdout reached EOF");
+                            break;
+                        }
                     }
                 }
             });
@@ -350,16 +434,20 @@ mod platform {
         pub fn snapshot(&self) -> Option<TrackSnapshot> {
             let guard = self.latest.read().ok()?;
             let received = guard.as_ref()?;
-            let mut snapshot = received.snapshot.clone();
-            snapshot.elapsed_time = received.elapsed_time();
-            let key = snapshot.track_key();
+            let key = received.snapshot.track_key();
             let should_copy_artwork = self
                 .artwork_delivery
                 .borrow_mut()
-                .should_deliver(key.as_deref(), snapshot.artwork.is_some());
-            if !should_copy_artwork {
-                snapshot.artwork = None;
-            }
+                .should_deliver(key.as_deref(), received.snapshot.artwork.is_some());
+            let mut snapshot = TrackSnapshot {
+                artwork: if should_copy_artwork {
+                    received.snapshot.artwork.clone()
+                } else {
+                    None
+                },
+                ..received.snapshot.clone_without_artwork()
+            };
+            snapshot.elapsed_time = received.elapsed_time();
             Some(snapshot)
         }
 
@@ -375,6 +463,85 @@ mod platform {
             if let Some(reader) = self.reader.take() {
                 let _ = reader.join();
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn candidate(title: &str, elapsed_time: f64, info_update_date: f64) -> PlaybackCandidate {
+            PlaybackCandidate {
+                stable_id: "music".into(),
+                bundle_id: Some("com.apple.Music".into()),
+                playing: true,
+                playing_resolved: true,
+                last_playing_date: Some(100.0),
+                elected: true,
+                title: Some(title.into()),
+                artist: Some("Artist".into()),
+                album: Some("Album".into()),
+                elapsed_time: Some(elapsed_time),
+                duration: Some(240.0),
+                playback_rate: Some(1.0),
+                info_update_date: Some(info_update_date),
+                artwork_data: None,
+            }
+        }
+
+        #[test]
+        fn stopped_state_preserves_identity_without_artwork_for_resume() {
+            let playing =
+                ReceivedNowPlaying::from_candidate(Some(&candidate("Song", 30.0, 0.0)), None);
+            let stopped = ReceivedNowPlaying::from_candidate(None, Some(&playing));
+
+            assert_eq!(stopped.snapshot.is_playing, Some(false));
+            assert_eq!(stopped.snapshot.title.as_deref(), Some("Song"));
+            assert_eq!(stopped.snapshot.artist.as_deref(), Some("Artist"));
+            assert_eq!(stopped.snapshot.album.as_deref(), Some("Album"));
+            assert_eq!(
+                stopped.snapshot.bundle_id.as_deref(),
+                Some("com.apple.Music")
+            );
+            assert!(stopped.snapshot.artwork.is_none());
+            assert!(same_track(&playing.snapshot, &stopped.snapshot));
+        }
+
+        #[test]
+        fn resume_after_stopped_state_anchors_at_fresh_elapsed_time() {
+            let stale_update_time = 0.0;
+            let playing = ReceivedNowPlaying::from_candidate(
+                Some(&candidate("Song", 30.0, stale_update_time)),
+                None,
+            );
+            let stopped = ReceivedNowPlaying::from_candidate(None, Some(&playing));
+            let resumed = ReceivedNowPlaying::from_candidate(
+                Some(&candidate("Song", 42.0, stale_update_time)),
+                Some(&stopped),
+            );
+
+            assert_eq!(resumed.snapshot.is_playing, Some(true));
+            assert_eq!(resumed.position_at_received, Some(42.0));
+            assert_eq!(resumed.snapshot.elapsed_time, Some(42.0));
+        }
+
+        #[test]
+        fn publish_stopped_overwrites_a_cached_playing_snapshot() {
+            let latest = RwLock::new(Some(ReceivedNowPlaying::from_candidate(
+                Some(&candidate("Song", 30.0, 0.0)),
+                None,
+            )));
+
+            publish_stopped(&latest, "test termination").expect("state update succeeds");
+
+            let latest = latest.read().expect("state lock is readable");
+            let snapshot = &latest
+                .as_ref()
+                .expect("stopped state is published")
+                .snapshot;
+            assert_eq!(snapshot.is_playing, Some(false));
+            assert_eq!(snapshot.title.as_deref(), Some("Song"));
+            assert!(snapshot.artwork.is_none());
         }
     }
 }
@@ -573,6 +740,35 @@ mod tests {
 
         assert!(first.track_key().is_some());
         assert_ne!(first.track_key(), second.track_key());
+    }
+
+    #[test]
+    fn clone_without_artwork_preserves_non_artwork_fields() {
+        use image::{Rgba, RgbaImage};
+
+        let mut original = snapshot(Some("com.apple.Music"), Some("Song"));
+        original.elapsed_time = Some(42.0);
+        original.duration = Some(240.0);
+        original.playback_rate = Some(0.5);
+        original.artwork_signature = Some(7);
+        original.artwork = Some(DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            1,
+            1,
+            Rgba([10, 20, 30, 255]),
+        )));
+
+        let cloned = original.clone_without_artwork();
+
+        assert_eq!(cloned.is_playing, original.is_playing);
+        assert_eq!(cloned.title, original.title);
+        assert_eq!(cloned.artist, original.artist);
+        assert_eq!(cloned.album, original.album);
+        assert_eq!(cloned.bundle_id, original.bundle_id);
+        assert_eq!(cloned.elapsed_time, original.elapsed_time);
+        assert_eq!(cloned.duration, original.duration);
+        assert_eq!(cloned.playback_rate, original.playback_rate);
+        assert_eq!(cloned.artwork_signature, original.artwork_signature);
+        assert!(cloned.artwork.is_none());
     }
 
     #[test]
