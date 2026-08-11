@@ -44,7 +44,32 @@ Reactive analysis listens to the complete mixed macOS system output. If several 
 
 Exactly one HID interface matching the Codex Micro is required. No matching device, more than one matching interface, or missing Input Monitoring access leaves `run` waiting for the controller and causes one-shot commands such as `probe` or `set` to report an error.
 
-## Installation
+## Download
+
+The current release is **v0.1.0**. Download the universal macOS archive and its SHA-256 checksum from GitHub Releases:
+
+```bash
+VERSION=0.1.0
+BASE_URL="https://github.com/hauntedfail/Codex-Micro-Chroma/releases/download/v${VERSION}"
+ARCHIVE="codex-micro-chroma-v${VERSION}-macos-universal.tar.gz"
+
+curl -LO "${BASE_URL}/${ARCHIVE}"
+curl -LO "${BASE_URL}/${ARCHIVE}.sha256"
+shasum -a 256 -c "${ARCHIVE}.sha256"
+tar -xzf "${ARCHIVE}"
+cd "codex-micro-chroma-v${VERSION}-macos-universal"
+./codex-micro-chroma --version
+```
+
+The release binary supports both Apple Silicon and Intel Macs. It is ad-hoc signed but is not Developer ID signed or notarised, so macOS may ask you to confirm the first launch in **System Settings > Privacy & Security**.
+
+To install the downloaded binary as a per-user LaunchAgent:
+
+```bash
+./codex-micro-chroma install
+```
+
+## Build from source
 
 Build the release binary from the project root:
 
@@ -234,6 +259,14 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
+
+## Publishing a release
+
+The `Release macOS binary` GitHub Actions workflow builds an ad-hoc-signed universal binary, creates a checksum, and publishes both files in a new GitHub Release. The requested version must match the `version` in `Cargo.toml`.
+
+To publish manually, open **Actions > Release macOS binary > Run workflow** and enter a version without the leading `v`, such as `0.1.0`. Alternatively, push a matching tag such as `v0.1.0`.
+
+An existing release or manually supplied existing tag is never overwritten. Update `Cargo.toml` and the version shown in the Download section before publishing the next version.
 
 ## Licence
 

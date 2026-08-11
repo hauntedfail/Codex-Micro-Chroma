@@ -1,0 +1,166 @@
+name: Release macOS binary
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the leading v
+        required: true
+        default: "0.1.0"
+        type: string
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BINARY_NAME: codex-micro-chroma
+  RUST_TOOLCHAIN: 1.88.0
+
+jobs:
+  release:
+    name: Build and publish universal macOS binary
+    runs-on: macos-15
+    steps:
+      - name: Check out the release source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve and validate the release version
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            version="$MANUAL_VERSION"
+          else
+            [[ "$REF_NAME" == v* ]] || {
+              echo "Expected a v-prefixed release tag, got: $REF_NAME" >&2
+              exit 1
+            }
+            version="${REF_NAME#v}"
+          fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version must use MAJOR.MINOR.PATCH format: $version" >&2
+            exit 1
+          fi
+
+          manifest_version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          if [[ "$version" != "$manifest_version" ]]; then
+            echo "Release version $version does not match Cargo.toml version $manifest_version" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse an existing release or manual tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; release assets are never overwritten" >&2
+            exit 1
+          fi
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]] && \
+             git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists; use a new version or push a new version tag" >&2
+            exit 1
+          fi
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup target add --toolchain "$RUST_TOOLCHAIN" \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin
+
+      - name: Test the release source
+        run: cargo +"$RUST_TOOLCHAIN" test --all-targets --all-features --locked
+
+      - name: Build both macOS architectures
+        run: |
+          set -euo pipefail
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --target aarch64-apple-darwin
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --target x86_64-apple-darwin
+
+      - name: Create and verify the universal binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          lipo -create \
+            "target/aarch64-apple-darwin/release/$BINARY_NAME" \
+            "target/x86_64-apple-darwin/release/$BINARY_NAME" \
+            -output "dist/$BINARY_NAME"
+          lipo "dist/$BINARY_NAME" -verify_arch arm64 x86_64
+          codesign --force --sign - \
+            --identifier com.local.codex-micro-chroma \
+            "dist/$BINARY_NAME"
+          codesign --verify --strict --verbose=2 "dist/$BINARY_NAME"
+          "dist/$BINARY_NAME" --version
+
+      - name: Package the release archive
+        id: package
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          package_name="$BINARY_NAME-$TAG-macos-universal"
+          archive="$package_name.tar.gz"
+          checksum="$archive.sha256"
+
+          mkdir -p "dist/$package_name"
+          install -m 0755 "dist/$BINARY_NAME" "dist/$package_name/$BINARY_NAME"
+          cp README.md LICENSE "dist/$package_name/"
+          tar -C dist -czf "dist/$archive" "$package_name"
+          (
+            cd dist
+            shasum -a 256 "$archive" > "$checksum"
+          )
+
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the GitHub Release
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          arguments=(
+            "$TAG"
+            "dist/$ARCHIVE#Universal macOS binary"
+            "dist/$CHECKSUM#SHA-256 checksum"
+            --fail-on-no-commits
+            --generate-notes
+            --title "Codex Micro Chroma $TAG"
+          )
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            arguments+=(--target "$GITHUB_SHA")
+          else
+            arguments+=(--verify-tag)
+          fi
+
+          gh release create "${arguments[@]}"
