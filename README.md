@@ -87,7 +87,9 @@ Codex Microで判明している次のeffectをすべて指定できます。
 - 白背景と透明ピクセルを除外し、支配的な色をLED向けに明るく鮮やかに補正します。
 - 新しいサムネイルを待つ間は、前コンテンツの色を消灯します。
 - 既定の `reactive` modeでは、相対音量をbrightness、複合的な運動性をspeed、音の広がり・変化をmagicへ反映します。
-- effectは900msのdwellと2秒のminimum holdを通して切り替え、短い休符では消灯しません。
+- onset、flux、pulse、bassの短いイベントはattack/release envelopeで保持し、650msのcandidate dwellを通過できるようにします。僅差の候補はhysteresisで維持するため、beatが次のaudio frameで消えても`snake`などの動的effectへ到達します。
+- effectは2秒のminimum holdでちらつきを防ぎます。同じpatternが12秒を超えて最有力のままなら、意味的に近い次点へphrase-levelで譲り、`breath`など一種類への固着を防ぎます。`rainbow`には12秒のcooldownがあります。
+- effectごとにspeedとmagicのprofileを変え、`solid`は静止、`snake`はbeat駆動、`gradient`はstereo width、`rainbow`はclimax、2種類のbreathは異なる深さとして送信します。短い休符では消灯しません。
 - HIDは一度開いた接続を再利用し、既定100ms間隔で更新します。起動時にデバイスまたは入力監視権限が未準備ならworkerを終了せず待機し、切断・response timeoutなどのtransport errorでは一度だけ自動再接続します。
 - 再生中にProcess Tapのframeが3秒停止するか、完全なゼロframeが15秒続いた場合は、30秒のcooldownを設けてTapとaggregate deviceを再生成します。
 - Control-CまたはSIGTERMで停止するとLEDを消灯します。

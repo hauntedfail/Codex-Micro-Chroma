@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use codex_micro_chroma::{
@@ -145,4 +146,89 @@ fn short_silence_does_not_immediately_turn_the_ring_off() {
     };
     let scene = composer.update(silent, Duration::from_millis(100));
     assert_ne!(scene.effect, LightingEffect::Off);
+}
+
+#[test]
+fn percussive_burst_is_held_long_enough_to_reach_snake() {
+    let mut composer = LightingComposer::new(Rgb::new(220, 80, 40));
+    let sustained = frame();
+    for _ in 0..16 {
+        composer.update(sustained, Duration::from_millis(250));
+    }
+
+    let mut burst = sustained;
+    burst.loudness = 0.12;
+    burst.peak = 0.35;
+    burst.bass = 0.98;
+    burst.flux = 0.92;
+    burst.onset = 0.98;
+    burst.pulse = 0.95;
+    burst.tempo_confidence = 0.90;
+    composer.update(burst, Duration::from_millis(100));
+
+    let mut reached_snake = false;
+    let mut observed = Vec::new();
+    for _ in 0..16 {
+        let scene = composer.update(sustained, Duration::from_millis(100));
+        observed.push(scene.effect);
+        reached_snake |= scene.effect == LightingEffect::Snake;
+    }
+    assert!(
+        reached_snake,
+        "a real beat is shorter than the effect dwell; observed {observed:?}"
+    );
+}
+
+#[test]
+fn a_long_musical_phrase_does_not_remain_on_one_pattern_forever() {
+    let mut composer = LightingComposer::new(Rgb::new(40, 160, 220));
+    let sustained = frame();
+    let mut effects = BTreeSet::new();
+
+    for _ in 0..160 {
+        let scene = composer.update(sustained, Duration::from_millis(250));
+        effects.insert(scene.effect.code());
+    }
+
+    assert!(
+        effects.len() >= 2,
+        "phrase-level variety should prevent a single effect from monopolizing playback"
+    );
+}
+
+#[test]
+fn effects_receive_visibly_distinct_motion_profiles() {
+    let color = Rgb::new(180, 60, 220);
+
+    let mut solid_composer = LightingComposer::new(color);
+    let mut direct = frame();
+    direct.mid = 0.95;
+    direct.bass = 0.05;
+    direct.stereo_width = 0.02;
+    direct.pulse = 0.0;
+    direct.tempo_confidence = 0.0;
+    direct.flatness = 0.35;
+    let solid = settle(&mut solid_composer, direct);
+
+    let mut snake_composer = LightingComposer::new(color);
+    let mut rhythmic = frame();
+    rhythmic.bass = 0.95;
+    rhythmic.onset = 0.85;
+    rhythmic.flux = 0.70;
+    rhythmic.pulse = 0.95;
+    rhythmic.tempo_confidence = 0.90;
+    let snake = settle(&mut snake_composer, rhythmic);
+
+    let mut gradient_composer = LightingComposer::new(color);
+    let mut wide = frame();
+    wide.stereo_width = 0.95;
+    wide.centroid = 0.55;
+    let gradient = settle(&mut gradient_composer, wide);
+
+    assert_eq!(solid.effect, LightingEffect::Solid);
+    assert!(solid.speed < 0.02 && solid.magic < 0.02);
+    assert_eq!(snake.effect, LightingEffect::Snake);
+    assert!(snake.speed > 0.65 && snake.magic > 0.45);
+    assert_eq!(gradient.effect, LightingEffect::Gradient);
+    assert!(gradient.magic > 0.70);
 }
