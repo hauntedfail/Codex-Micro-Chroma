@@ -235,8 +235,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-## Licence and credits
+## Licence
 
 Codex Micro Chroma is available under the [MIT Licence](LICENSE).
-
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution for MediaRemote Adapter, the referenced Codex Micro HID implementations, and the Core Audio Process Tap reference.
