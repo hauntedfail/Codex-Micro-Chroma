@@ -11,6 +11,8 @@ struct PlaybackCandidate {
     bundle_id: Option<String>,
     playing: bool,
     #[serde(default)]
+    playing_resolved: bool,
+    #[serde(default)]
     last_playing_date: Option<f64>,
     #[serde(default)]
     elected: bool,
@@ -35,7 +37,7 @@ struct PlaybackCandidate {
 fn select_playback_candidate(candidates: &[PlaybackCandidate]) -> Option<&PlaybackCandidate> {
     candidates
         .iter()
-        .filter(|candidate| candidate.playing)
+        .filter(|candidate| candidate.playing && candidate.playing_resolved)
         .max_by(|left, right| {
             left.last_playing_date
                 .unwrap_or(f64::NEG_INFINITY)
@@ -429,6 +431,7 @@ mod tests {
             stable_id: stable_id.into(),
             bundle_id: None,
             playing,
+            playing_resolved: true,
             last_playing_date,
             elected,
             title: None,
@@ -492,6 +495,18 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_scoped_playback_state_does_not_revive_a_stale_playback_rate() {
+        let mut stale = candidate("music", true, Some(200.0), true);
+        stale.playing_resolved = false;
+        let candidates = [candidate("spotify", true, Some(100.0), false), stale];
+
+        assert_eq!(
+            select_playback_candidate(&candidates).map(|value| value.stable_id.as_str()),
+            Some("spotify")
+        );
+    }
+
+    #[test]
     fn stable_identifier_makes_a_missing_date_tie_deterministic() {
         let candidates = [
             candidate("spotify", true, None, false),
@@ -511,6 +526,7 @@ mod tests {
                 "stableId":"com.apple.Music:default",
                 "bundleId":"com.apple.Music",
                 "playing":true,
+                "playingResolved":true,
                 "lastPlayingDate":123.5,
                 "elected":true,
                 "title":"Song"

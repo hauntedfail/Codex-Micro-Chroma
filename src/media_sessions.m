@@ -12,6 +12,7 @@ typedef void (*MRGetInfoForPlayer)(id, BOOL, dispatch_queue_t,
 static MRGetNowPlayingClients getNowPlayingClients;
 static MRGetPlayerForClient getPlayerForClient;
 static MRGetInfoForPlayer getInfoForPlayer;
+static dispatch_queue_t requestQueue;
 static BOOL refreshInFlight = NO;
 static NSData *previousPayloadData = nil;
 
@@ -152,10 +153,21 @@ static void refreshSessions(void) {
                     @"stableId" : stableID,
                     @"bundleId" : bundleID,
                     @"playing" : @NO,
+                    @"playingResolved" : @NO,
                     @"elected" : @([playerPath isEqual:electedPath]),
                 } mutableCopy];
                 [candidates addObject:entry];
-                __block BOOL requestPlayingResolved = NO;
+
+                id request = requestClass
+                                 ? ((id(*)(id, SEL, id))objc_msgSend)(
+                                       [requestClass alloc],
+                                       NSSelectorFromString(@"initWithPlayerPath:"),
+                                       playerPath)
+                                 : nil;
+                SEL isPlayingSelector = NSSelectorFromString(
+                    @"requestIsPlayingOnQueue:completion:");
+                BOOL supportsScopedPlaying =
+                    request && [request respondsToSelector:isPlayingSelector];
 
                 dispatch_group_enter(group);
                 getInfoForPlayer(playerPath, YES, queue,
@@ -173,9 +185,10 @@ static void refreshSessions(void) {
                                  @"kMRMediaRemoteNowPlayingInfoDuration");
                       copyNumber(entry, @"playbackRate", information,
                                  @"kMRMediaRemoteNowPlayingInfoPlaybackRate");
-                      NSNumber *rate = entry[@"playbackRate"];
-                      if (rate && !requestPlayingResolved) {
-                          entry[@"playing"] = @([rate doubleValue] > 0.0);
+                      if (!supportsScopedPlaying) {
+                          NSNumber *rate = entry[@"playbackRate"];
+                          entry[@"playing"] = @(rate && [rate doubleValue] > 0.0);
+                          entry[@"playingResolved"] = @YES;
                       }
                       id timestamp = information[
                           @"kMRMediaRemoteNowPlayingInfoTimestamp"];
@@ -193,23 +206,19 @@ static void refreshSessions(void) {
                   dispatch_group_leave(group);
                 });
 
-                if (requestClass) {
-                    id request = ((id(*)(id, SEL, id))objc_msgSend)(
-                        [requestClass alloc],
-                        NSSelectorFromString(@"initWithPlayerPath:"), playerPath);
-                    SEL isPlayingSelector = NSSelectorFromString(
-                        @"requestIsPlayingOnQueue:completion:");
-                    if (request && [request respondsToSelector:isPlayingSelector]) {
+                if (request) {
+                    if (supportsScopedPlaying) {
                         dispatch_group_enter(group);
                         ((void (*)(id, SEL, dispatch_queue_t,
                                    void (^)(BOOL, NSError *)))objc_msgSend)(
-                            request, isPlayingSelector, queue,
+                            request, isPlayingSelector, requestQueue,
                             ^(BOOL playing, NSError *error) {
                               (void)request;
-                              (void)error;
-                              requestPlayingResolved = YES;
-                              entry[@"playing"] = @(playing);
-                              dispatch_group_leave(group);
+                              dispatch_async(queue, ^{
+                                entry[@"playing"] = @(error == nil && playing);
+                                entry[@"playingResolved"] = @YES;
+                                dispatch_group_leave(group);
+                              });
                             });
                     }
 
@@ -219,15 +228,17 @@ static void refreshSessions(void) {
                         dispatch_group_enter(group);
                         ((void (*)(id, SEL, dispatch_queue_t,
                                    void (^)(NSDate *, NSError *)))objc_msgSend)(
-                            request, lastPlayingSelector, queue,
+                            request, lastPlayingSelector, requestQueue,
                             ^(NSDate *date, NSError *error) {
                               (void)request;
                               (void)error;
-                              if ([date isKindOfClass:[NSDate class]]) {
-                                  entry[@"lastPlayingDate"] =
-                                      @([date timeIntervalSince1970]);
-                              }
-                              dispatch_group_leave(group);
+                              dispatch_async(queue, ^{
+                                if ([date isKindOfClass:[NSDate class]]) {
+                                    entry[@"lastPlayingDate"] =
+                                        @([date timeIntervalSince1970]);
+                                }
+                                dispatch_group_leave(group);
+                              });
                             });
                     }
                 }
@@ -267,6 +278,8 @@ __attribute__((visibility("default"))) void chroma_media_sessions_stream(void) {
             fprintf(stderr, "required per-player MediaRemote symbols are unavailable\n");
             return;
         }
+        requestQueue = dispatch_queue_create(
+            "com.local.codex-micro-chroma.media-sessions", DISPATCH_QUEUE_SERIAL);
 
         Class requestClass = NSClassFromString(@"MRNowPlayingRequest");
         if (!requestClass ||
