@@ -291,13 +291,14 @@ static void refreshSessions(void) {
                             request, lastPlayingSelector, requestQueue,
                             ^(NSDate *date, NSError *error) {
                               (void)request;
-                              (void)error;
                               dispatch_async(queue, ^{
                                 if (completed) {
                                     dispatch_group_leave(group);
                                     return;
                                 }
-                                if ([date isKindOfClass:[NSDate class]]) {
+                                if (error) {
+                                    refreshValid = NO;
+                                } else if ([date isKindOfClass:[NSDate class]]) {
                                     entry[@"lastPlayingDate"] =
                                         @([date timeIntervalSince1970]);
                                 }

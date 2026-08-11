@@ -229,31 +229,58 @@ mod platform {
 
     struct ReceivedNowPlaying {
         snapshot: TrackSnapshot,
+        artwork: Option<CachedArtwork>,
         position_at_received: Option<f64>,
         received_at: Instant,
+    }
+
+    struct CachedArtwork {
+        key: Arc<ArtworkCacheKey>,
+        image: Arc<image::DynamicImage>,
+        signature: u64,
+    }
+
+    impl Clone for CachedArtwork {
+        fn clone(&self) -> Self {
+            Self {
+                key: self.key.clone(),
+                image: Arc::clone(&self.image),
+                signature: self.signature,
+            }
+        }
+    }
+
+    #[derive(Clone, PartialEq, Eq)]
+    struct ArtworkCacheKey {
+        stable_id: String,
+        encoded_artwork: String,
+    }
+
+    impl ArtworkCacheKey {
+        fn matches_candidate(&self, candidate: &PlaybackCandidate, encoded_artwork: &str) -> bool {
+            self.stable_id == candidate.stable_id.as_str()
+                && self.encoded_artwork == encoded_artwork
+        }
     }
 
     impl ReceivedNowPlaying {
         fn from_candidate(candidate: Option<&PlaybackCandidate>, previous: Option<&Self>) -> Self {
             let received_at = Instant::now();
-            if candidate.is_none() {
+            let Some(candidate) = candidate else {
                 return Self::stopped_from_previous(previous, received_at);
-            }
-            let artwork = candidate
-                .and_then(|candidate| candidate.artwork_data.as_deref())
-                .and_then(|encoded| general_purpose::STANDARD.decode(encoded).ok())
-                .and_then(|bytes| image::load_from_memory(&bytes).ok());
+            };
+            let artwork = Self::artwork_from_candidate(candidate, previous);
             let mut snapshot = TrackSnapshot {
-                is_playing: Some(candidate.is_some_and(|candidate| candidate.playing)),
-                title: candidate.and_then(|candidate| candidate.title.clone()),
-                artist: candidate.and_then(|candidate| candidate.artist.clone()),
-                album: candidate.and_then(|candidate| candidate.album.clone()),
-                bundle_id: candidate.and_then(|candidate| candidate.bundle_id.clone()),
-                elapsed_time: candidate.and_then(|candidate| candidate.elapsed_time),
-                duration: candidate.and_then(|candidate| candidate.duration),
-                playback_rate: candidate.and_then(|candidate| candidate.playback_rate),
-                artwork_signature: artwork.as_ref().map(artwork_signature),
-                artwork,
+                is_playing: Some(candidate.playing),
+                title: candidate.title.clone(),
+                artist: candidate.artist.clone(),
+                album: candidate.album.clone(),
+                bundle_id: candidate.bundle_id.clone(),
+                elapsed_time: candidate.elapsed_time,
+                duration: candidate.duration,
+                playback_rate: candidate.playback_rate,
+                artwork_signature: artwork.as_ref().map(|artwork| artwork.signature),
+                artwork: None,
             };
             let resumed = previous.is_some_and(|previous| {
                 same_track(&previous.snapshot, &snapshot)
@@ -261,7 +288,7 @@ mod platform {
                     && snapshot.is_playing == Some(true)
             });
             let info_update_time = candidate
-                .and_then(|candidate| candidate.info_update_date)
+                .info_update_date
                 .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
                 .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs_f64(seconds)));
             let update_age_seconds = info_update_time.and_then(|updated_at| {
@@ -281,9 +308,34 @@ mod platform {
             snapshot.elapsed_time = position_at_received;
             Self {
                 snapshot,
+                artwork,
                 position_at_received,
                 received_at,
             }
+        }
+
+        fn artwork_from_candidate(
+            candidate: &PlaybackCandidate,
+            previous: Option<&Self>,
+        ) -> Option<CachedArtwork> {
+            let encoded_artwork = candidate.artwork_data.as_ref()?;
+            if let Some(artwork) = previous
+                .and_then(|previous| previous.artwork.as_ref())
+                .filter(|artwork| artwork.key.matches_candidate(candidate, encoded_artwork))
+            {
+                return Some(artwork.clone());
+            }
+            let bytes = general_purpose::STANDARD.decode(encoded_artwork).ok()?;
+            let image = image::load_from_memory(&bytes).ok()?;
+            let signature = artwork_signature(&image);
+            Some(CachedArtwork {
+                key: Arc::new(ArtworkCacheKey {
+                    stable_id: candidate.stable_id.clone(),
+                    encoded_artwork: encoded_artwork.clone(),
+                }),
+                image: Arc::new(image),
+                signature,
+            })
         }
 
         fn stopped_from_previous(previous: Option<&Self>, received_at: Instant) -> Self {
@@ -308,6 +360,7 @@ mod platform {
             snapshot.elapsed_time = position_at_received;
             Self {
                 snapshot,
+                artwork: None,
                 position_at_received,
                 received_at,
             }
@@ -438,10 +491,13 @@ mod platform {
             let should_copy_artwork = self
                 .artwork_delivery
                 .borrow_mut()
-                .should_deliver(key.as_deref(), received.snapshot.artwork.is_some());
+                .should_deliver(key.as_deref(), received.artwork.is_some());
             let mut snapshot = TrackSnapshot {
                 artwork: if should_copy_artwork {
-                    received.snapshot.artwork.clone()
+                    received
+                        .artwork
+                        .as_ref()
+                        .map(|artwork| (*artwork.image).clone())
                 } else {
                     None
                 },
@@ -469,6 +525,8 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use image::{ImageFormat, Rgba, RgbaImage};
+        use std::io::Cursor;
 
         fn candidate(title: &str, elapsed_time: f64, info_update_date: f64) -> PlaybackCandidate {
             PlaybackCandidate {
@@ -486,6 +544,27 @@ mod platform {
                 playback_rate: Some(1.0),
                 info_update_date: Some(info_update_date),
                 artwork_data: None,
+            }
+        }
+
+        fn encoded_artwork(red: u8, green: u8, blue: u8) -> String {
+            let image = image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+                2,
+                2,
+                Rgba([red, green, blue, 255]),
+            ));
+            let mut bytes = Vec::new();
+            image
+                .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+                .expect("test image encodes");
+            general_purpose::STANDARD.encode(bytes)
+        }
+
+        fn candidate_with_artwork(stable_id: &str, encoded_artwork: String) -> PlaybackCandidate {
+            PlaybackCandidate {
+                stable_id: stable_id.into(),
+                artwork_data: Some(encoded_artwork),
+                ..candidate("Song", 30.0, 0.0)
             }
         }
 
@@ -542,6 +621,77 @@ mod platform {
             assert_eq!(snapshot.is_playing, Some(false));
             assert_eq!(snapshot.title.as_deref(), Some("Song"));
             assert!(snapshot.artwork.is_none());
+        }
+
+        #[test]
+        fn unchanged_session_and_artwork_reuses_decoded_image() {
+            let encoded_artwork = encoded_artwork(10, 20, 30);
+            let first_candidate = candidate_with_artwork("music", encoded_artwork.clone());
+            let first = ReceivedNowPlaying::from_candidate(Some(&first_candidate), None);
+            let second_candidate = PlaybackCandidate {
+                elapsed_time: Some(42.0),
+                info_update_date: Some(10.0),
+                ..candidate_with_artwork("music", encoded_artwork)
+            };
+
+            let second = ReceivedNowPlaying::from_candidate(Some(&second_candidate), Some(&first));
+
+            let first_artwork = first.artwork.as_ref().expect("first artwork decodes");
+            let second_artwork = second.artwork.as_ref().expect("second artwork is present");
+            assert!(Arc::ptr_eq(&first_artwork.key, &second_artwork.key));
+            assert!(Arc::ptr_eq(&first_artwork.image, &second_artwork.image));
+            assert_eq!(first_artwork.signature, second_artwork.signature);
+            assert!(second.snapshot.artwork.is_none());
+        }
+
+        #[test]
+        fn changed_session_identity_decodes_artwork_again() {
+            let encoded_artwork = encoded_artwork(10, 20, 30);
+            let first_candidate = candidate_with_artwork("music", encoded_artwork.clone());
+            let first = ReceivedNowPlaying::from_candidate(Some(&first_candidate), None);
+            let second_candidate = candidate_with_artwork("spotify", encoded_artwork);
+
+            let second = ReceivedNowPlaying::from_candidate(Some(&second_candidate), Some(&first));
+
+            let first_artwork = first.artwork.as_ref().expect("first artwork decodes");
+            let second_artwork = second.artwork.as_ref().expect("second artwork decodes");
+            assert!(!Arc::ptr_eq(&first_artwork.image, &second_artwork.image));
+            assert_eq!(first_artwork.signature, second_artwork.signature);
+        }
+
+        #[test]
+        fn changed_encoded_artwork_decodes_and_updates_signature() {
+            let first_candidate = candidate_with_artwork("music", encoded_artwork(10, 20, 30));
+            let first = ReceivedNowPlaying::from_candidate(Some(&first_candidate), None);
+            let second_candidate = candidate_with_artwork("music", encoded_artwork(30, 20, 10));
+
+            let second = ReceivedNowPlaying::from_candidate(Some(&second_candidate), Some(&first));
+
+            let first_artwork = first.artwork.as_ref().expect("first artwork decodes");
+            let second_artwork = second.artwork.as_ref().expect("second artwork decodes");
+            assert!(!Arc::ptr_eq(&first_artwork.image, &second_artwork.image));
+            assert_ne!(first_artwork.signature, second_artwork.signature);
+            assert_ne!(
+                first.snapshot.artwork_signature,
+                second.snapshot.artwork_signature
+            );
+        }
+
+        #[test]
+        fn stopped_state_clears_cached_artwork() {
+            let playing = ReceivedNowPlaying::from_candidate(
+                Some(&candidate_with_artwork(
+                    "music",
+                    encoded_artwork(10, 20, 30),
+                )),
+                None,
+            );
+
+            let stopped = ReceivedNowPlaying::from_candidate(None, Some(&playing));
+
+            assert!(stopped.artwork.is_none());
+            assert!(stopped.snapshot.artwork_signature.is_some());
+            assert!(stopped.snapshot.artwork.is_none());
         }
     }
 }
