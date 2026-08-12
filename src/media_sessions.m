@@ -499,8 +499,11 @@ static void copyMetadata(NSMutableDictionary *entry, NSDictionary *information,
                @"kMRMediaRemoteNowPlayingInfoPlaybackRate");
     if (resolvePlayingFromRate) {
         NSNumber *rate = entry[@"playbackRate"];
-        entry[@"playing"] = @(rate && [rate doubleValue] > 0.0);
-        entry[@"playingResolved"] = @YES;
+        if ([rate isKindOfClass:[NSNumber class]] &&
+            isfinite([rate doubleValue])) {
+            entry[@"playing"] = @([rate doubleValue] > 0.0);
+            entry[@"playingResolved"] = @YES;
+        }
     }
     copyDateSeconds(entry, @"infoUpdateDate",
                     information[@"kMRMediaRemoteNowPlayingInfoTimestamp"]);
@@ -1078,6 +1081,16 @@ static NSMutableDictionary *smokeRecord(NSMutableDictionary *entry) {
     return [@{ @"entry" : entry, @"playerPath" : entry } mutableCopy];
 }
 
+static BOOL smokeFallbackRateResolves(NSDictionary *information,
+                                      BOOL expectedPlaying,
+                                      BOOL expectedResolved) {
+    NSMutableDictionary *entry =
+        smokeCandidate(@"fallback-rate", NO, NO, 0.0, NO, NO);
+    copyMetadata(entry, information, @"fallback-rate", NO, YES);
+    return [entry[@"playing"] boolValue] == expectedPlaying &&
+           [entry[@"playingResolved"] boolValue] == expectedResolved;
+}
+
 static NSSet<NSString *> *markSelectedArtworkForRecords(NSArray *records) {
     ArtworkSelectionState state = makeArtworkSelectionState();
     markSelectedArtworkForRecordsWithState(records, &state);
@@ -1627,6 +1640,26 @@ static int runSmokeTests(void) {
         publicCandidates(candidateEntriesFromRecords(topRecords));
     if (publicTop.count != MAX_ENRICHED_PLAYING_CANDIDATES) {
         fprintf(stderr, "public candidate count exceeded top-K cap\n");
+        return 1;
+    }
+
+    if (!smokeFallbackRateResolves(@{}, NO, NO) ||
+        !smokeFallbackRateResolves(
+            @{ @"kMRMediaRemoteNowPlayingInfoPlaybackRate" : @(NAN) }, NO,
+            NO) ||
+        !smokeFallbackRateResolves(
+            @{ @"kMRMediaRemoteNowPlayingInfoPlaybackRate" : @(INFINITY) }, NO,
+            NO) ||
+        !smokeFallbackRateResolves(
+            @{ @"kMRMediaRemoteNowPlayingInfoPlaybackRate" : @0.0 }, NO,
+            YES) ||
+        !smokeFallbackRateResolves(
+            @{ @"kMRMediaRemoteNowPlayingInfoPlaybackRate" : @1.0 }, YES,
+            YES) ||
+        !smokeFallbackRateResolves(
+            @{ @"kMRMediaRemoteNowPlayingInfoPlaybackRate" : @-1.0 }, NO,
+            YES)) {
+        fprintf(stderr, "metadata fallback playbackRate resolution failed\n");
         return 1;
     }
 
