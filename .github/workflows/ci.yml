@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: 1.88.0
+
+jobs:
+  rust:
+    name: Rust checks and macOS builds
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          rustup target add --toolchain "$RUST_TOOLCHAIN" \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin
+
+      - name: Smoke test Objective-C media helper
+        run: |
+          set -euo pipefail
+          smoke_executable="${RUNNER_TEMP}/codex_micro_chroma_media_sessions_smoke"
+          /usr/bin/xcrun clang \
+            -fobjc-arc \
+            -fblocks \
+            -Wall \
+            -Wextra \
+            -Werror \
+            -DMEDIA_SESSIONS_SMOKE \
+            -framework Foundation \
+            src/media_sessions.m \
+            -o "$smoke_executable"
+          "$smoke_executable"
+
+      - name: Check formatting
+        run: cargo +"$RUST_TOOLCHAIN" fmt --all --check
+
+      - name: Lint
+        run: cargo +"$RUST_TOOLCHAIN" clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo +"$RUST_TOOLCHAIN" test --all-targets --all-features --locked
+
+      - name: Build arm64 release binary
+        run: |
+          set -euo pipefail
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --target aarch64-apple-darwin
+          helper_count="$(find target/aarch64-apple-darwin/release/build -path '*/out/codex_micro_chroma_media_sessions' -print | wc -l | tr -d ' ')"
+          test "$helper_count" = "1"
+          helper="$(find target/aarch64-apple-darwin/release/build -path '*/out/codex_micro_chroma_media_sessions' -print)"
+          /usr/bin/lipo "$helper" -verify_arch arm64
+          /usr/bin/codesign --verify --verbose "$helper"
+          /usr/bin/codesign -dv "$helper"
+
+      - name: Build x86_64 release binary
+        run: |
+          set -euo pipefail
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --target x86_64-apple-darwin
+          helper_count="$(find target/x86_64-apple-darwin/release/build -path '*/out/codex_micro_chroma_media_sessions' -print | wc -l | tr -d ' ')"
+          test "$helper_count" = "1"
+          helper="$(find target/x86_64-apple-darwin/release/build -path '*/out/codex_micro_chroma_media_sessions' -print)"
+          /usr/bin/lipo "$helper" -verify_arch x86_64
+          /usr/bin/codesign --verify --verbose "$helper"
+          /usr/bin/codesign -dv "$helper"
