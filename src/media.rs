@@ -491,11 +491,21 @@ mod platform {
                         return;
                     }
                 }
+                let mut reported_parse_error = false;
                 loop {
                     match lines.next() {
                         Some(Ok(line)) => {
-                            let Ok(payload) = serde_json::from_str::<SessionPayload>(&line) else {
-                                continue;
+                            let payload = match serde_json::from_str::<SessionPayload>(&line) {
+                                Ok(payload) => payload,
+                                Err(error) => {
+                                    if !reported_parse_error {
+                                        reported_parse_error = true;
+                                        eprintln!(
+                                            "MediaRemote session helper sent an unparsable payload: {error}"
+                                        );
+                                    }
+                                    continue;
+                                }
                             };
                             let selected = select_playback_candidate(&payload.candidates);
                             if let Ok(mut latest) = reader_latest.write() {
@@ -519,26 +529,21 @@ mod platform {
                     }
                 }
             });
-            match ready_rx.recv_timeout(HELPER_READY_TIMEOUT) {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = reader.join();
-                    bail!("{error}");
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = reader.join();
-                    bail!("MediaRemote session helper did not become ready within {HELPER_READY_TIMEOUT:?}");
-                }
+            let ready_error = match ready_rx.recv_timeout(HELPER_READY_TIMEOUT) {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(mpsc::RecvTimeoutError::Timeout) => Some(format!(
+                    "MediaRemote session helper did not become ready within {HELPER_READY_TIMEOUT:?}"
+                )),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = reader.join();
-                    bail!("MediaRemote session helper reader stopped before ready");
+                    Some("MediaRemote session helper reader stopped before ready".to_owned())
                 }
+            };
+            if let Some(error) = ready_error {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                bail!("{error}");
             }
             Ok(Self {
                 child,
@@ -882,6 +887,19 @@ mod tests {
         let candidates = [
             candidate("spotify", true, Some(100.0), false),
             candidate("music", true, Some(100.0), true),
+        ];
+
+        assert_eq!(
+            select_playback_candidate(&candidates).map(|value| value.stable_id.as_str()),
+            Some("music")
+        );
+    }
+
+    #[test]
+    fn os_elected_session_breaks_missing_date_ties() {
+        let candidates = [
+            candidate("spotify", true, None, false),
+            candidate("music", true, None, true),
         ];
 
         assert_eq!(

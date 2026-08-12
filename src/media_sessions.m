@@ -104,13 +104,15 @@ static NSArray *publicCandidatesIfComplete(NSArray *candidates, BOOL *complete) 
 
         BOOL playing = [candidate[@"playing"] boolValue];
         if (playing) {
-            if (![candidate[@"metadataResolved"] boolValue] ||
-                [candidate[@"lastPlayingDateError"] boolValue]) {
+            if (![candidate[@"metadataResolved"] boolValue]) {
                 valid = NO;
             }
         }
 
         NSMutableDictionary *publicCandidate = [candidate mutableCopy];
+        if ([candidate[@"lastPlayingDateError"] boolValue]) {
+            [publicCandidate removeObjectForKey:@"lastPlayingDate"];
+        }
         [publicCandidate removeObjectForKey:@"metadataResolved"];
         [publicCandidate removeObjectForKey:@"lastPlayingDateError"];
         [publicCandidates addObject:publicCandidate];
