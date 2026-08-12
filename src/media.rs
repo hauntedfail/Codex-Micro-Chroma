@@ -178,7 +178,12 @@ struct ArtworkDelivery {
 #[cfg(any(target_os = "macos", test))]
 impl ArtworkDelivery {
     fn should_deliver(&mut self, key: Option<&str>, artwork_available: bool) -> bool {
-        let Some(key) = key.filter(|_| artwork_available) else {
+        if !artwork_available {
+            self.last_key = None;
+            return false;
+        }
+
+        let Some(key) = key else {
             return false;
         };
         if self.last_key.as_deref() == Some(key) {
@@ -1667,6 +1672,17 @@ mod tests {
         assert!(!delivery.should_deliver(Some("track"), true));
         delivery.invalidate();
         assert!(delivery.should_deliver(Some("track"), true));
+    }
+
+    #[test]
+    fn artwork_can_be_delivered_again_after_no_artwork_observation() {
+        let mut delivery = ArtworkDelivery::default();
+
+        assert!(delivery.should_deliver(Some("track"), true));
+        assert!(!delivery.should_deliver(Some("track"), true));
+        assert!(!delivery.should_deliver(Some("track"), false));
+        assert!(delivery.should_deliver(Some("track"), true));
+        assert!(!delivery.should_deliver(Some("track"), true));
     }
 
     #[test]
