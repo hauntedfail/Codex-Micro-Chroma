@@ -426,6 +426,12 @@ mod platform {
         Ok(())
     }
 
+    fn terminate_helper_before_ready(child: &mut Child, reader: JoinHandle<()>) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+    }
+
     pub struct MediaRemoteSource {
         child: Child,
         reader: Option<JoinHandle<()>>,
@@ -540,9 +546,7 @@ mod platform {
                 }
             };
             if let Some(error) = ready_error {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
+                terminate_helper_before_ready(&mut child, reader);
                 bail!("{error}");
             }
             Ok(Self {
@@ -900,6 +904,19 @@ mod tests {
         let candidates = [
             candidate("spotify", true, None, false),
             candidate("music", true, None, true),
+        ];
+
+        assert_eq!(
+            select_playback_candidate(&candidates).map(|value| value.stable_id.as_str()),
+            Some("music")
+        );
+    }
+
+    #[test]
+    fn missing_date_candidate_still_participates_in_stop_fallback() {
+        let candidates = [
+            candidate("spotify", false, Some(300.0), true),
+            candidate("music", true, None, false),
         ];
 
         assert_eq!(
