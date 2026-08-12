@@ -35,10 +35,10 @@ static char **helperArgv = NULL;
 static const NSUInteger MAX_TEXT_FIELD_BYTES = 8 * 1024;
 static const NSUInteger MAX_RAW_ARTWORK_BYTES = 8 * 1024 * 1024;
 static const NSUInteger MAX_SERIALIZED_ARTWORK_BYTES = 16 * 1024 * 1024;
-static const NSUInteger MAX_ARTWORK_CACHE_BYTES = 32 * 1024 * 1024;
+static const NSUInteger MAX_ARTWORK_CACHE_BYTES = 24 * 1024 * 1024;
 static const NSUInteger MAX_ENRICHED_PLAYING_CANDIDATES = 8;
 static const NSUInteger MAX_PHASE1_BATCH_CLIENTS = 8;
-static const NSUInteger MAX_PHASE2_BATCH_RECORDS = 4;
+static const NSUInteger MAX_PHASE2_BATCH_RECORDS = 1;
 
 static id objectProperty(id object, NSString *selectorName) {
     SEL selector = NSSelectorFromString(selectorName);
@@ -471,6 +471,17 @@ static void copyDateSeconds(NSMutableDictionary *destination, NSString *outputKe
     }
 }
 
+static void clearMutableMediaMetadata(NSMutableDictionary *entry) {
+    [entry removeObjectForKey:@"title"];
+    [entry removeObjectForKey:@"artist"];
+    [entry removeObjectForKey:@"album"];
+    [entry removeObjectForKey:@"elapsedTime"];
+    [entry removeObjectForKey:@"duration"];
+    [entry removeObjectForKey:@"playbackRate"];
+    [entry removeObjectForKey:@"infoUpdateDate"];
+    [entry removeObjectForKey:@"artworkData"];
+}
+
 static void copyMetadata(NSMutableDictionary *entry, NSDictionary *information,
                          NSString *stableID, BOOL includeArtwork,
                          BOOL resolvePlayingFromRate) {
@@ -614,6 +625,28 @@ static void insertTopRecord(NSMutableArray *topRecords, NSDictionary *record,
     if (![entry isKindOfClass:[NSDictionary class]] ||
         ![entry[@"playing"] boolValue] ||
         ![entry[@"playingResolved"] boolValue]) {
+        return;
+    }
+    NSString *stableID = entry[@"stableId"];
+    if (![stableID isKindOfClass:[NSString class]]) {
+        return;
+    }
+    for (NSUInteger index = 0; index < topRecords.count; index++) {
+        NSDictionary *existingRecord = topRecords[index];
+        NSDictionary *existingEntry = existingRecord[@"entry"];
+        NSString *existingStableID = existingEntry[@"stableId"];
+        if (![existingEntry isKindOfClass:[NSDictionary class]] ||
+            ![existingStableID isKindOfClass:[NSString class]] ||
+            ![existingStableID isEqualToString:stableID]) {
+            continue;
+        }
+        if (compareRecordRank(record, existingRecord) == NSOrderedAscending) {
+            topRecords[index] = record;
+            [topRecords sortUsingComparator:^NSComparisonResult(NSDictionary *left,
+                                                                NSDictionary *right) {
+              return compareRecordRank(left, right);
+            }];
+        }
         return;
     }
     [topRecords addObject:record];
@@ -808,7 +841,7 @@ static void refreshSessions(void) {
                   return;
               }
               if (retainedRawArtworkBytesForRecords(batchRecords) >
-                  MAX_ARTWORK_CACHE_BYTES) {
+                  MAX_PHASE2_BATCH_RECORDS * MAX_RAW_ARTWORK_BYTES) {
                   fprintf(stderr,
                           "phase-2 retained artwork exceeded batch cap\n");
                   restartAfterTimeout();
@@ -821,8 +854,11 @@ static void refreshSessions(void) {
                   NSMutableDictionary *entry = record[@"entry"];
                   NSDictionary *information = record[@"information"];
                   NSString *stableID = entry[@"stableId"];
-                  if (![entry isKindOfClass:[NSMutableDictionary class]] ||
-                      ![information isKindOfClass:[NSDictionary class]] ||
+                  if (![entry isKindOfClass:[NSMutableDictionary class]]) {
+                      continue;
+                  }
+                  clearMutableMediaMetadata(entry);
+                  if (![information isKindOfClass:[NSDictionary class]] ||
                       ![stableID isKindOfClass:[NSString class]]) {
                       continue;
                   }
@@ -1111,6 +1147,17 @@ static int runSmokeTests(void) {
     }
 
     pruneArtworkCache([NSSet set]);
+    NSMutableData *maxArtwork =
+        [NSMutableData dataWithLength:MAX_RAW_ARTWORK_BYTES];
+    NSString *maxEncoded = cachedArtworkData(@"max", maxArtwork);
+    NSUInteger maxCost = artworkCacheCost(maxArtwork, maxEncoded);
+    if (!maxEncoded || !artworkCache[@"max"] || artworkCacheBytes != maxCost ||
+        maxCost > MAX_ARTWORK_CACHE_BYTES) {
+        fprintf(stderr, "artwork cache max raw admission failed\n");
+        return 1;
+    }
+
+    pruneArtworkCache([NSSet set]);
     if (artworkCache.count != 0 || artworkCacheBytes != 0) {
         fprintf(stderr, "artwork cache prune accounting failed\n");
         return 1;
@@ -1216,9 +1263,16 @@ static int runSmokeTests(void) {
         };
         [phase2BatchRecords addObject:record];
     }
-    if (MAX_PHASE2_BATCH_RECORDS != 4 ||
+    if (MAX_ARTWORK_CACHE_BYTES +
+            MAX_PHASE2_BATCH_RECORDS * MAX_RAW_ARTWORK_BYTES !=
+        32 * 1024 * 1024) {
+        fprintf(stderr, "global retained artwork ceiling proof failed\n");
+        return 1;
+    }
+    if (MAX_ARTWORK_CACHE_BYTES != 24 * 1024 * 1024 ||
+        MAX_PHASE2_BATCH_RECORDS != 1 ||
         retainedRawArtworkBytesForRecords(phase2BatchRecords) !=
-            MAX_ARTWORK_CACHE_BYTES) {
+            MAX_PHASE2_BATCH_RECORDS * MAX_RAW_ARTWORK_BYTES) {
         fprintf(stderr, "phase-2 retained artwork batch bound failed\n");
         return 1;
     }
@@ -1431,6 +1485,35 @@ static int runSmokeTests(void) {
         return 1;
     }
 
+    NSMutableDictionary *phase1FallbackEntry =
+        smokeCandidate(@"phase1-fallback", YES, YES, 6000.0, YES, YES);
+    phase1FallbackEntry[@"bundleId"] = @"bundle";
+    phase1FallbackEntry[@"title"] = @"phase-one-title";
+    phase1FallbackEntry[@"artist"] = @"phase-one-artist";
+    phase1FallbackEntry[@"album"] = @"phase-one-album";
+    phase1FallbackEntry[@"elapsedTime"] = @1.0;
+    phase1FallbackEntry[@"duration"] = @2.0;
+    phase1FallbackEntry[@"playbackRate"] = @1.0;
+    phase1FallbackEntry[@"infoUpdateDate"] = @123.0;
+    phase1FallbackEntry[@"artworkData"] = @"phase-one-artwork";
+    clearMutableMediaMetadata(phase1FallbackEntry);
+    copyMetadata(phase1FallbackEntry, @{}, @"phase1-fallback", YES, NO);
+    if (phase1FallbackEntry[@"title"] || phase1FallbackEntry[@"artist"] ||
+        phase1FallbackEntry[@"album"] || phase1FallbackEntry[@"elapsedTime"] ||
+        phase1FallbackEntry[@"duration"] ||
+        phase1FallbackEntry[@"playbackRate"] ||
+        phase1FallbackEntry[@"infoUpdateDate"] ||
+        phase1FallbackEntry[@"artworkData"] ||
+        ![phase1FallbackEntry[@"stableId"] isEqualToString:@"phase1-fallback"] ||
+        ![phase1FallbackEntry[@"bundleId"] isEqualToString:@"bundle"] ||
+        ![phase1FallbackEntry[@"playing"] boolValue] ||
+        ![phase1FallbackEntry[@"playingResolved"] boolValue] ||
+        ![phase1FallbackEntry[@"lastPlayingDate"] isEqual:@6000.0] ||
+        ![phase1FallbackEntry[@"elected"] boolValue]) {
+        fprintf(stderr, "empty phase-2 metadata did not clear phase-1 fields\n");
+        return 1;
+    }
+
     NSMutableArray *manyCandidates = [NSMutableArray array];
     for (NSUInteger i = 0; i < MAX_ENRICHED_PLAYING_CANDIDATES + 4; i++) {
         [manyCandidates addObject:smokeCandidate(
@@ -1485,6 +1568,59 @@ static int runSmokeTests(void) {
     if ([topRecords.firstObject objectForKey:@"entry"] != lateBatchWinner) {
         fprintf(stderr, "streaming top records dropped late batch winner\n");
         return 1;
+    }
+
+    NSMutableDictionary *duplicateOlder =
+        smokeCandidate(@"duplicate-top", YES, YES, 1000.0, YES, NO);
+    NSMutableDictionary *duplicateNewer =
+        smokeCandidate(@"duplicate-top", YES, YES, 2000.0, YES, NO);
+    NSMutableDictionary *duplicateElected =
+        smokeCandidate(@"duplicate-top-election", YES, YES, 0.0, NO, YES);
+    NSMutableDictionary *duplicateUnelected =
+        smokeCandidate(@"duplicate-top-election", YES, YES, 0.0, NO, NO);
+    NSMutableDictionary *duplicateEqualFirst =
+        smokeCandidate(@"duplicate-top-equal", YES, YES, 3000.0, YES, NO);
+    NSMutableDictionary *duplicateEqualSecond =
+        smokeCandidate(@"duplicate-top-equal", YES, YES, 3000.0, YES, NO);
+    NSMutableArray *duplicateTopRecords = [NSMutableArray array];
+    insertTopRecord(duplicateTopRecords, smokeRecord(duplicateOlder),
+                    MAX_ENRICHED_PLAYING_CANDIDATES);
+    insertTopRecord(duplicateTopRecords, smokeRecord(duplicateNewer),
+                    MAX_ENRICHED_PLAYING_CANDIDATES);
+    if (duplicateTopRecords.count != 1 ||
+        [duplicateTopRecords.firstObject objectForKey:@"entry"] != duplicateNewer) {
+        fprintf(stderr, "duplicate top record did not keep newest date\n");
+        return 1;
+    }
+    insertTopRecord(duplicateTopRecords, smokeRecord(duplicateUnelected),
+                    MAX_ENRICHED_PLAYING_CANDIDATES);
+    insertTopRecord(duplicateTopRecords, smokeRecord(duplicateElected),
+                    MAX_ENRICHED_PLAYING_CANDIDATES);
+    BOOL keptDuplicateElected = NO;
+    for (NSDictionary *record in duplicateTopRecords) {
+        if ([record objectForKey:@"entry"] == duplicateElected) {
+            keptDuplicateElected = YES;
+        }
+    }
+    if (duplicateTopRecords.count != 2 || !keptDuplicateElected) {
+        fprintf(stderr, "duplicate top record did not keep elected tie winner\n");
+        return 1;
+    }
+    insertTopRecord(duplicateTopRecords, smokeRecord(duplicateEqualFirst),
+                    MAX_ENRICHED_PLAYING_CANDIDATES);
+    insertTopRecord(duplicateTopRecords, smokeRecord(duplicateEqualSecond),
+                    MAX_ENRICHED_PLAYING_CANDIDATES);
+    if (duplicateTopRecords.count != 3) {
+        fprintf(stderr, "duplicate top record count was not coalesced\n");
+        return 1;
+    }
+    for (NSDictionary *record in duplicateTopRecords) {
+        NSDictionary *candidate = record[@"entry"];
+        if ([candidate[@"stableId"] isEqualToString:@"duplicate-top-equal"] &&
+            candidate != duplicateEqualFirst) {
+            fprintf(stderr, "equal duplicate top record did not keep first\n");
+            return 1;
+        }
     }
 
     NSArray *publicTop =
