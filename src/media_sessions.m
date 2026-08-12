@@ -140,6 +140,33 @@ static BOOL addWouldExceedNSUInteger(NSUInteger left, NSUInteger right,
     return left > limit || right > limit - left;
 }
 
+static BOOL base64EncodedLength(NSUInteger rawLength, NSUInteger *encodedLength) {
+    NSUInteger chunks = rawLength / 3;
+    NSUInteger remainder = rawLength % 3;
+    if (chunks > NSUIntegerMax / 4) {
+        return NO;
+    }
+    NSUInteger length = chunks * 4;
+    if (remainder != 0) {
+        if (addWouldExceedNSUInteger(length, 4, NSUIntegerMax)) {
+            return NO;
+        }
+        length += 4;
+    }
+    *encodedLength = length;
+    return YES;
+}
+
+static BOOL artworkCacheCostForLengths(NSUInteger rawLength,
+                                       NSUInteger encodedLength,
+                                       NSUInteger *cost) {
+    if (addWouldExceedNSUInteger(rawLength, encodedLength, NSUIntegerMax)) {
+        return NO;
+    }
+    *cost = rawLength + encodedLength;
+    return YES;
+}
+
 static NSUInteger artworkCacheCost(NSData *data, NSString *encoded) {
     if (!data || !encoded) {
         return 0;
@@ -190,12 +217,25 @@ static NSString *cachedArtworkData(NSString *stableID, NSData *artwork) {
         return cachedEncoded;
     }
 
-    NSString *encoded = [artwork base64EncodedStringWithOptions:0];
     removeCachedArtwork(stableID);
-    NSUInteger cost = artworkCacheCost(artwork, encoded);
+    NSUInteger encodedLength = 0;
+    NSUInteger cost = 0;
+    if (!base64EncodedLength(artwork.length, &encodedLength) ||
+        !artworkCacheCostForLengths(artwork.length, encodedLength, &cost) ||
+        addWouldExceedNSUInteger(artworkCacheBytes, cost,
+                                 MAX_ARTWORK_CACHE_BYTES)) {
+        return nil;
+    }
+
+    NSString *encoded = [artwork base64EncodedStringWithOptions:0];
+    if ([encoded lengthOfBytesUsingEncoding:NSUTF8StringEncoding] !=
+        encodedLength) {
+        return nil;
+    }
+    cost = artworkCacheCost(artwork, encoded);
     if (addWouldExceedNSUInteger(artworkCacheBytes, cost,
                                  MAX_ARTWORK_CACHE_BYTES)) {
-        return encoded;
+        return nil;
     }
 
     artworkCache[stableID] = @{ @"data" : [artwork copy], @"encoded" : encoded };
@@ -209,6 +249,90 @@ static void pruneArtworkCache(NSSet<NSString *> *activeStableIDs) {
             removeCachedArtwork(stableID);
         }
     }
+}
+
+static NSData *recordArtworkData(NSDictionary *record) {
+    NSDictionary *information = record[@"information"];
+    if (![information isKindOfClass:[NSDictionary class]]) {
+        return nil;
+    }
+    id artwork = information[@"kMRMediaRemoteNowPlayingInfoArtworkData"];
+    return [artwork isKindOfClass:[NSData class]] ? artwork : nil;
+}
+
+static void pruneArtworkCacheForSelectedRecords(NSArray *records,
+                                                NSSet<NSString *> *stableIDs) {
+    pruneArtworkCache(stableIDs);
+    for (NSDictionary *record in records) {
+        if (![record[@"includeArtwork"] boolValue]) {
+            continue;
+        }
+        NSDictionary *entry = record[@"entry"];
+        NSString *stableID = entry[@"stableId"];
+        NSData *artworkData = recordArtworkData(record);
+        if (![stableID isKindOfClass:[NSString class]] || !artworkData) {
+            continue;
+        }
+
+        NSDictionary *cached = artworkCache[stableID];
+        NSData *cachedData = cached[@"data"];
+        if ([cachedData isKindOfClass:[NSData class]] &&
+            ![cachedData isEqualToData:artworkData]) {
+            removeCachedArtwork(stableID);
+        }
+    }
+}
+
+static NSSet<NSString *> *markSelectedArtworkForRecords(NSArray *records) {
+    NSMutableSet<NSString *> *selected = [NSMutableSet set];
+    NSMutableSet<NSString *> *seenStableIDs = [NSMutableSet set];
+    NSUInteger serializedArtworkBytes = 0;
+    NSUInteger selectedCacheBytes = 0;
+
+    for (NSMutableDictionary *record in records) {
+        if (![record isKindOfClass:[NSMutableDictionary class]]) {
+            continue;
+        }
+        [record removeObjectForKey:@"includeArtwork"];
+        NSDictionary *entry = record[@"entry"];
+        NSString *stableID = entry[@"stableId"];
+        if (![entry isKindOfClass:[NSDictionary class]] ||
+            ![stableID isKindOfClass:[NSString class]] ||
+            [seenStableIDs containsObject:stableID] ||
+            ![entry[@"playing"] boolValue] ||
+            ![entry[@"playingResolved"] boolValue]) {
+            continue;
+        }
+        [seenStableIDs addObject:stableID];
+
+        NSData *artworkData = recordArtworkData(record);
+        if (!artworkData) {
+            continue;
+        }
+        if (artworkData.length > MAX_RAW_ARTWORK_BYTES) {
+            continue;
+        }
+
+        NSUInteger encodedLength = 0;
+        NSUInteger cost = 0;
+        if (!base64EncodedLength(artworkData.length, &encodedLength) ||
+            encodedLength > MAX_SERIALIZED_ARTWORK_BYTES ||
+            addWouldExceedNSUInteger(serializedArtworkBytes, encodedLength,
+                                     MAX_SERIALIZED_ARTWORK_BYTES) ||
+            !artworkCacheCostForLengths(artworkData.length, encodedLength,
+                                        &cost) ||
+            addWouldExceedNSUInteger(selectedCacheBytes, cost,
+                                     MAX_ARTWORK_CACHE_BYTES)) {
+            continue;
+        }
+
+        [selected addObject:stableID];
+        record[@"includeArtwork"] = @YES;
+        serializedArtworkBytes += encodedLength;
+        selectedCacheBytes += cost;
+    }
+
+    return selected;
 }
 
 static void copyString(NSMutableDictionary *destination, NSString *outputKey,
@@ -533,12 +657,37 @@ static void refreshSessions(void) {
               getInfoForPlayer(playerPath, YES, queue,
                                ^(NSDictionary *information) {
                 if (!completed) {
-                    copyMetadata(entry, information, stableID, YES, NO);
+                    if ([record isKindOfClass:[NSMutableDictionary class]] &&
+                        [information isKindOfClass:[NSDictionary class]]) {
+                        ((NSMutableDictionary *)record)[@"information"] =
+                            information;
+                    }
                 }
                 dispatch_group_leave(enrichmentGroup);
               });
           }
           dispatch_group_notify(enrichmentGroup, queue, ^{
+            NSSet<NSString *> *selectedArtworkStableIDs =
+                markSelectedArtworkForRecords(topRecords);
+            pruneArtworkCacheForSelectedRecords(topRecords,
+                                                selectedArtworkStableIDs);
+            for (NSDictionary *record in topRecords) {
+                NSMutableDictionary *entry = record[@"entry"];
+                NSDictionary *information = record[@"information"];
+                NSString *stableID = entry[@"stableId"];
+                if (![entry isKindOfClass:[NSMutableDictionary class]] ||
+                    ![information isKindOfClass:[NSDictionary class]] ||
+                    ![stableID isKindOfClass:[NSString class]]) {
+                    continue;
+                }
+                copyMetadata(entry, information, stableID,
+                             [record[@"includeArtwork"] boolValue],
+                             NO);
+                if ([record isKindOfClass:[NSMutableDictionary class]]) {
+                    [(NSMutableDictionary *)record removeObjectForKey:@"includeArtwork"];
+                    [(NSMutableDictionary *)record removeObjectForKey:@"information"];
+                }
+            }
             complete(NO);
           });
         };
@@ -618,11 +767,11 @@ static void refreshSessions(void) {
                     @"requestIsPlayingOnQueue:completion:");
                 BOOL supportsScopedPlaying =
                     request && [request respondsToSelector:isPlayingSelector];
-                NSDictionary *record = @{
+                NSMutableDictionary *record = [@{
                     @"entry" : entry,
                     @"playerPath" : playerPath,
                     @"supportsScopedPlaying" : @(supportsScopedPlaying),
-                };
+                } mutableCopy];
                 [batchRecords addObject:record];
 
                 if (request && supportsScopedPlaying) {
@@ -739,8 +888,8 @@ static NSMutableDictionary *smokeCandidate(NSString *stableID, BOOL playing,
     return candidate;
 }
 
-static NSDictionary *smokeRecord(NSMutableDictionary *entry) {
-    return @{ @"entry" : entry, @"playerPath" : entry };
+static NSMutableDictionary *smokeRecord(NSMutableDictionary *entry) {
+    return [@{ @"entry" : entry, @"playerPath" : entry } mutableCopy];
 }
 
 static int runSmokeTests(void) {
@@ -800,7 +949,7 @@ static int runSmokeTests(void) {
         return 1;
     }
     NSString *uncachedEncoded = cachedArtworkData(@"two", largeArtwork);
-    if (!uncachedEncoded || artworkCache[@"two"] || artworkCacheBytes != largeCost) {
+    if (uncachedEncoded || artworkCache[@"two"] || artworkCacheBytes != largeCost) {
         fprintf(stderr, "artwork cache oversize replacement accounting failed\n");
         return 1;
     }
@@ -808,6 +957,147 @@ static int runSmokeTests(void) {
     pruneArtworkCache([NSSet set]);
     if (artworkCache.count != 0 || artworkCacheBytes != 0) {
         fprintf(stderr, "artwork cache prune accounting failed\n");
+        return 1;
+    }
+
+    NSUInteger encodedLength = 0;
+    if (!base64EncodedLength(0, &encodedLength) || encodedLength != 0 ||
+        !base64EncodedLength(1, &encodedLength) || encodedLength != 4 ||
+        !base64EncodedLength(2, &encodedLength) || encodedLength != 4 ||
+        !base64EncodedLength(3, &encodedLength) || encodedLength != 4 ||
+        !base64EncodedLength(4, &encodedLength) || encodedLength != 8) {
+        fprintf(stderr, "base64 encoded length accounting failed\n");
+        return 1;
+    }
+
+    NSMutableData *winnerArtwork =
+        [NSMutableData dataWithLength:MAX_RAW_ARTWORK_BYTES - 1];
+    NSMutableData *rejectedArtwork =
+        [NSMutableData dataWithLength:MAX_RAW_ARTWORK_BYTES - 1];
+    NSMutableData *thirdArtwork = [NSMutableData dataWithLength:3];
+    NSMutableDictionary *winner =
+        smokeCandidate(@"winner", YES, YES, 3000.0, YES, NO);
+    NSMutableDictionary *runnerUp =
+        smokeCandidate(@"runner-up", YES, YES, 2000.0, YES, NO);
+    NSMutableDictionary *third =
+        smokeCandidate(@"third", YES, YES, 1000.0, YES, NO);
+    NSMutableDictionary *winnerRecord = smokeRecord(winner);
+    NSMutableDictionary *runnerUpRecord = smokeRecord(runnerUp);
+    NSMutableDictionary *thirdRecord = smokeRecord(third);
+    winnerRecord[@"information"] =
+        @{ @"kMRMediaRemoteNowPlayingInfoArtworkData" : winnerArtwork };
+    runnerUpRecord[@"information"] =
+        @{ @"kMRMediaRemoteNowPlayingInfoArtworkData" : rejectedArtwork };
+    thirdRecord[@"information"] =
+        @{ @"kMRMediaRemoteNowPlayingInfoArtworkData" : thirdArtwork };
+    NSArray *selectionRecords = @[ winnerRecord, runnerUpRecord, thirdRecord ];
+    NSSet<NSString *> *selectedArtworkStableIDs =
+        markSelectedArtworkForRecords(selectionRecords);
+    if (![selectedArtworkStableIDs containsObject:@"winner"] ||
+        [selectedArtworkStableIDs containsObject:@"runner-up"] ||
+        ![selectedArtworkStableIDs containsObject:@"third"] ||
+        ![winnerRecord[@"includeArtwork"] boolValue] ||
+        runnerUpRecord[@"includeArtwork"] ||
+        ![thirdRecord[@"includeArtwork"] boolValue]) {
+        fprintf(stderr, "artwork selection did not preserve winner-first budget\n");
+        return 1;
+    }
+    pruneArtworkCacheForSelectedRecords(selectionRecords,
+                                        selectedArtworkStableIDs);
+    for (NSMutableDictionary *record in selectionRecords) {
+        NSMutableDictionary *entry = record[@"entry"];
+        NSString *stableID = entry[@"stableId"];
+        copyMetadata(entry, record[@"information"], stableID,
+                     [record[@"includeArtwork"] boolValue], NO);
+        [record removeObjectForKey:@"includeArtwork"];
+        [record removeObjectForKey:@"information"];
+    }
+    if (!winner[@"artworkData"] || runnerUp[@"artworkData"] ||
+        !third[@"artworkData"] || artworkCache.count != 2 ||
+        !artworkCache[@"winner"] ||
+        !artworkCache[@"third"] ||
+        artworkCacheBytes !=
+            artworkCacheCost(winnerArtwork, winner[@"artworkData"]) +
+                artworkCacheCost(thirdArtwork, third[@"artworkData"])) {
+        fprintf(stderr, "artwork selection/cache admission failed\n");
+        return 1;
+    }
+
+    artworkCache = [NSMutableDictionary dictionary];
+    artworkCacheBytes = 0;
+    NSMutableData *oldLowerArtwork =
+        [NSMutableData dataWithLength:MAX_RAW_ARTWORK_BYTES - 1];
+    NSMutableData *newWinnerArtwork =
+        [NSMutableData dataWithLength:MAX_RAW_ARTWORK_BYTES - 1];
+    NSMutableData *newLowerArtwork = [NSMutableData dataWithLength:3];
+    if (!cachedArtworkData(@"lower", oldLowerArtwork)) {
+        fprintf(stderr, "stale artwork cache setup failed\n");
+        return 1;
+    }
+    NSMutableDictionary *changedWinner =
+        smokeCandidate(@"changed-winner", YES, YES, 4000.0, YES, NO);
+    NSMutableDictionary *changedLower =
+        smokeCandidate(@"lower", YES, YES, 3000.0, YES, NO);
+    NSMutableDictionary *changedWinnerRecord = smokeRecord(changedWinner);
+    NSMutableDictionary *changedLowerRecord = smokeRecord(changedLower);
+    changedWinnerRecord[@"information"] =
+        @{ @"kMRMediaRemoteNowPlayingInfoArtworkData" : newWinnerArtwork };
+    changedLowerRecord[@"information"] =
+        @{ @"kMRMediaRemoteNowPlayingInfoArtworkData" : newLowerArtwork };
+    NSArray *changedRecords = @[ changedWinnerRecord, changedLowerRecord ];
+    selectedArtworkStableIDs = markSelectedArtworkForRecords(changedRecords);
+    pruneArtworkCacheForSelectedRecords(changedRecords,
+                                        selectedArtworkStableIDs);
+    if (artworkCache[@"lower"]) {
+        fprintf(stderr, "stale selected cache entry was not evicted\n");
+        return 1;
+    }
+    for (NSMutableDictionary *record in changedRecords) {
+        NSMutableDictionary *entry = record[@"entry"];
+        NSString *stableID = entry[@"stableId"];
+        copyMetadata(entry, record[@"information"], stableID,
+                     [record[@"includeArtwork"] boolValue], NO);
+    }
+    if (!changedWinner[@"artworkData"] || !changedLower[@"artworkData"] ||
+        !artworkCache[@"changed-winner"] || !artworkCache[@"lower"]) {
+        fprintf(stderr, "stale selected cache entry blocked changed artwork\n");
+        return 1;
+    }
+
+    artworkCache = [NSMutableDictionary dictionary];
+    artworkCacheBytes = 0;
+    NSMutableDictionary *duplicateFirst =
+        smokeCandidate(@"duplicate", YES, YES, 2000.0, YES, NO);
+    NSMutableDictionary *duplicateSecond =
+        smokeCandidate(@"duplicate", YES, YES, 1000.0, YES, NO);
+    NSMutableDictionary *duplicateFirstRecord = smokeRecord(duplicateFirst);
+    NSMutableDictionary *duplicateSecondRecord = smokeRecord(duplicateSecond);
+    duplicateFirstRecord[@"information"] =
+        @{ @"kMRMediaRemoteNowPlayingInfoArtworkData" :
+               [@"first" dataUsingEncoding:NSUTF8StringEncoding] };
+    duplicateSecondRecord[@"information"] =
+        @{ @"kMRMediaRemoteNowPlayingInfoArtworkData" :
+               [@"second" dataUsingEncoding:NSUTF8StringEncoding] };
+    NSArray *duplicateRecords =
+        @[ duplicateFirstRecord, duplicateSecondRecord ];
+    selectedArtworkStableIDs = markSelectedArtworkForRecords(duplicateRecords);
+    if (selectedArtworkStableIDs.count != 1 ||
+        ![duplicateFirstRecord[@"includeArtwork"] boolValue] ||
+        duplicateSecondRecord[@"includeArtwork"]) {
+        fprintf(stderr, "duplicate stable ID artwork selection was not record-specific\n");
+        return 1;
+    }
+    pruneArtworkCacheForSelectedRecords(duplicateRecords,
+                                        selectedArtworkStableIDs);
+    for (NSMutableDictionary *record in duplicateRecords) {
+        NSMutableDictionary *entry = record[@"entry"];
+        NSString *stableID = entry[@"stableId"];
+        copyMetadata(entry, record[@"information"], stableID,
+                     [record[@"includeArtwork"] boolValue], NO);
+    }
+    if (!duplicateFirst[@"artworkData"] || duplicateSecond[@"artworkData"] ||
+        artworkCache.count != 1) {
+        fprintf(stderr, "duplicate stable ID encoded more artwork than budgeted\n");
         return 1;
     }
 
