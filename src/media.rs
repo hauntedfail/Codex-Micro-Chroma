@@ -230,6 +230,7 @@ mod platform {
     #[derive(Debug, PartialEq, Eq)]
     enum HelperControlMessage {
         Ready,
+        Reset { reason: Option<String> },
         Invalid(String),
     }
 
@@ -242,6 +243,14 @@ mod platform {
                     .unwrap_or(false) =>
             {
                 HelperControlMessage::Ready
+            }
+            Ok(serde_json::Value::Object(map)) if map.contains_key("reset") => {
+                HelperControlMessage::Reset {
+                    reason: map
+                        .get("reset")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                }
             }
             _ => HelperControlMessage::Invalid(line.to_owned()),
         }
@@ -426,6 +435,41 @@ mod platform {
         Ok(())
     }
 
+    fn process_started_helper_line(
+        latest: &RwLock<Option<ReceivedNowPlaying>>,
+        reported_parse_error: &mut bool,
+        line: &str,
+    ) {
+        match parse_helper_control_line(line) {
+            HelperControlMessage::Ready => {
+                return;
+            }
+            HelperControlMessage::Reset { reason } => {
+                let reason = reason.as_deref().unwrap_or("control reset requested");
+                let _ = publish_stopped(latest, reason);
+                return;
+            }
+            HelperControlMessage::Invalid(_) => {}
+        }
+        let payload = match serde_json::from_str::<SessionPayload>(line) {
+            Ok(payload) => payload,
+            Err(error) => {
+                if !*reported_parse_error {
+                    *reported_parse_error = true;
+                    eprintln!("MediaRemote session helper sent an unparsable payload: {error}");
+                }
+                return;
+            }
+        };
+        let selected = select_playback_candidate(&payload.candidates);
+        if let Ok(mut latest) = latest.write() {
+            *latest = Some(ReceivedNowPlaying::from_candidate(
+                selected,
+                latest.as_ref(),
+            ));
+        }
+    }
+
     fn terminate_helper_before_ready(child: &mut Child, reader: JoinHandle<()>) {
         let _ = child.kill();
         let _ = child.wait();
@@ -477,6 +521,12 @@ mod platform {
                         HelperControlMessage::Ready => {
                             let _ = ready_tx.send(Ok(()));
                         }
+                        HelperControlMessage::Reset { .. } => {
+                            let _ = ready_tx.send(Err(format!(
+                                "MediaRemote session helper reset before ready: {line}"
+                            )));
+                            return;
+                        }
                         HelperControlMessage::Invalid(line) => {
                             let _ = ready_tx.send(Err(format!(
                                 "malformed pre-ready output from MediaRemote session helper: {line}"
@@ -501,25 +551,11 @@ mod platform {
                 loop {
                     match lines.next() {
                         Some(Ok(line)) => {
-                            let payload = match serde_json::from_str::<SessionPayload>(&line) {
-                                Ok(payload) => payload,
-                                Err(error) => {
-                                    if !reported_parse_error {
-                                        reported_parse_error = true;
-                                        eprintln!(
-                                            "MediaRemote session helper sent an unparsable payload: {error}"
-                                        );
-                                    }
-                                    continue;
-                                }
-                            };
-                            let selected = select_playback_candidate(&payload.candidates);
-                            if let Ok(mut latest) = reader_latest.write() {
-                                *latest = Some(ReceivedNowPlaying::from_candidate(
-                                    selected,
-                                    latest.as_ref(),
-                                ));
-                            }
+                            process_started_helper_line(
+                                &reader_latest,
+                                &mut reported_parse_error,
+                                &line,
+                            );
                         }
                         Some(Err(error)) => {
                             let _ = publish_stopped(
@@ -828,6 +864,16 @@ mod platform {
         }
 
         #[test]
+        fn helper_control_line_accepts_reset_message() {
+            assert_eq!(
+                parse_helper_control_line(r#"{"reset":"timeout"}"#),
+                HelperControlMessage::Reset {
+                    reason: Some("timeout".to_owned())
+                }
+            );
+        }
+
+        #[test]
         fn helper_control_line_rejects_session_payload_before_ready() {
             assert_eq!(
                 parse_helper_control_line(r#"{"candidates":[]}"#),
@@ -840,6 +886,58 @@ mod platform {
             assert_eq!(
                 parse_helper_control_line("not json"),
                 HelperControlMessage::Invalid("not json".to_owned())
+            );
+        }
+
+        #[test]
+        fn reset_control_line_after_ready_clears_cached_playing_state() {
+            let latest = RwLock::new(Some(ReceivedNowPlaying::from_candidate(
+                Some(&candidate("Song", 30.0, 0.0)),
+                None,
+            )));
+            let mut reported_parse_error = false;
+
+            process_started_helper_line(
+                &latest,
+                &mut reported_parse_error,
+                r#"{"reset":"timeout"}"#,
+            );
+
+            assert!(!reported_parse_error);
+            let latest = latest.read().expect("state lock is readable");
+            let snapshot = &latest
+                .as_ref()
+                .expect("stopped state is published")
+                .snapshot;
+            assert_eq!(snapshot.is_playing, Some(false));
+            assert_eq!(snapshot.title.as_deref(), Some("Song"));
+            assert!(snapshot.artwork.is_none());
+        }
+
+        #[test]
+        fn ready_control_line_after_reset_is_not_reported_as_parse_error() {
+            let latest = RwLock::new(Some(ReceivedNowPlaying::from_candidate(
+                Some(&candidate("Song", 30.0, 0.0)),
+                None,
+            )));
+            let mut reported_parse_error = false;
+
+            process_started_helper_line(
+                &latest,
+                &mut reported_parse_error,
+                r#"{"reset":"timeout"}"#,
+            );
+            process_started_helper_line(&latest, &mut reported_parse_error, r#"{"ready":true}"#);
+
+            assert!(!reported_parse_error);
+            let latest = latest.read().expect("state lock is readable");
+            assert_eq!(
+                latest
+                    .as_ref()
+                    .expect("state remains published")
+                    .snapshot
+                    .is_playing,
+                Some(false)
             );
         }
     }

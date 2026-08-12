@@ -1,8 +1,11 @@
 #import <Foundation/Foundation.h>
 #import <dispatch/dispatch.h>
 #import <dlfcn.h>
+#import <errno.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <string.h>
+#import <unistd.h>
 
 typedef void (*MRGetNowPlayingClients)(dispatch_queue_t, void (^)(id));
 typedef void (*MRGetPlayerForClient)(id, id, dispatch_queue_t, void (^)(id));
@@ -24,6 +27,7 @@ static dispatch_queue_t requestQueue;
 static BOOL refreshInFlight = NO;
 static NSData *previousPayloadData = nil;
 static NSMutableDictionary<NSString *, NSDictionary *> *artworkCache = nil;
+static char **helperArgv = NULL;
 
 static id objectProperty(id object, NSString *selectorName) {
     SEL selector = NSSelectorFromString(selectorName);
@@ -134,6 +138,20 @@ static void printCandidates(NSArray *candidates) {
 
 static void scheduleRefresh(void);
 
+static void restartAfterTimeout(void) {
+    printf("{\"reset\":\"timeout\"}\n");
+    fflush(stdout);
+    if (!helperArgv || !helperArgv[0]) {
+        fprintf(stderr, "could not restart MediaRemote session helper after timeout: missing executable path\n");
+        _exit(70);
+    }
+    execv(helperArgv[0], helperArgv);
+    fprintf(stderr,
+            "could not restart MediaRemote session helper after timeout via execv(%s): %s\n",
+            helperArgv[0], strerror(errno));
+    _exit(70);
+}
+
 static void refreshSessions(void) {
     if (refreshInFlight) {
         return;
@@ -153,7 +171,9 @@ static void refreshSessions(void) {
           return;
       }
       completed = YES;
-      if (!timedOut) {
+      if (timedOut) {
+          restartAfterTimeout();
+      } else {
           printCandidates(publicCandidates(candidates));
           pruneArtworkCache(activeStableIDs);
       }
@@ -350,7 +370,9 @@ static void printReady(void) {
     fflush(stdout);
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
+    (void)argc;
+    helperArgv = argv;
     @autoreleasepool {
         NSBundle *framework = [NSBundle bundleWithPath:
             @"/System/Library/PrivateFrameworks/MediaRemote.framework"];
