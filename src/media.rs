@@ -198,7 +198,7 @@ mod platform {
     use std::{
         cell::RefCell,
         fs,
-        io::{BufRead, BufReader},
+        io::{BufRead, BufReader, Cursor},
         os::unix::fs::PermissionsExt,
         process::{Child, Command, Stdio},
         sync::{mpsc, Arc, RwLock},
@@ -208,6 +208,7 @@ mod platform {
 
     use anyhow::{bail, Context, Result};
     use base64::{engine::general_purpose, Engine as _};
+    use image::{ImageReader, Limits};
     use serde::Deserialize;
     use tempfile::TempDir;
 
@@ -221,6 +222,12 @@ mod platform {
         "/codex_micro_chroma_media_sessions"
     ));
     const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(2);
+    const MAX_HELPER_JSON_LINE_BYTES: usize = 24 * 1024 * 1024;
+    const MAX_ENCODED_ARTWORK_BYTES: usize = 12 * 1024 * 1024;
+    const MAX_RAW_ARTWORK_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_IMAGE_WIDTH: u32 = 4096;
+    const MAX_IMAGE_HEIGHT: u32 = 4096;
+    const MAX_IMAGE_DECODER_ALLOC_BYTES: u64 = 96 * 1024 * 1024;
 
     #[derive(Deserialize)]
     struct SessionPayload {
@@ -348,6 +355,9 @@ mod platform {
             previous: Option<&Self>,
         ) -> Option<CachedArtwork> {
             let encoded_artwork = candidate.artwork_data.as_ref()?;
+            if encoded_artwork.len() > MAX_ENCODED_ARTWORK_BYTES {
+                return None;
+            }
             if let Some(artwork) = previous
                 .and_then(|previous| previous.artwork.as_ref())
                 .filter(|artwork| artwork.key.matches_candidate(candidate, encoded_artwork))
@@ -355,7 +365,18 @@ mod platform {
                 return Some(artwork.clone());
             }
             let bytes = general_purpose::STANDARD.decode(encoded_artwork).ok()?;
-            let image = image::load_from_memory(&bytes).ok()?;
+            if bytes.len() > MAX_RAW_ARTWORK_BYTES {
+                return None;
+            }
+            let mut reader = ImageReader::new(Cursor::new(bytes))
+                .with_guessed_format()
+                .ok()?;
+            let mut limits = Limits::default();
+            limits.max_image_width = Some(MAX_IMAGE_WIDTH);
+            limits.max_image_height = Some(MAX_IMAGE_HEIGHT);
+            limits.max_alloc = Some(MAX_IMAGE_DECODER_ALLOC_BYTES);
+            reader.limits(limits);
+            let image = reader.decode().ok()?;
             let signature = artwork_signature(&image);
             Some(CachedArtwork {
                 key: Arc::new(ArtworkCacheKey {
@@ -470,6 +491,72 @@ mod platform {
         }
     }
 
+    fn read_bounded_line<R: BufRead>(
+        reader: &mut R,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<String>> {
+        let mut bytes = Vec::new();
+        loop {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            let newline_index = available.iter().position(|byte| *byte == b'\n');
+            let segment_len = newline_index.map_or(available.len(), |index| index + 1);
+            let remaining = max_bytes.saturating_sub(bytes.len());
+            if segment_len > remaining {
+                reader.consume(remaining);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("helper JSON line exceeded {max_bytes} bytes"),
+                ));
+            }
+            bytes.extend_from_slice(&available[..segment_len]);
+            reader.consume(segment_len);
+            if newline_index.is_some() {
+                break;
+            }
+        }
+        if bytes.ends_with(b"\n") {
+            bytes.pop();
+            if bytes.ends_with(b"\r") {
+                bytes.pop();
+            }
+        }
+        String::from_utf8(bytes).map(Some).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("helper JSON line was not UTF-8: {error}"),
+            )
+        })
+    }
+
+    fn process_started_helper_stream<R: BufRead>(
+        latest: &RwLock<Option<ReceivedNowPlaying>>,
+        reader: &mut R,
+        publish_stopped_on_eof: bool,
+    ) -> std::io::Result<()> {
+        let mut reported_parse_error = false;
+        loop {
+            match read_bounded_line(reader, MAX_HELPER_JSON_LINE_BYTES) {
+                Ok(Some(line)) => {
+                    process_started_helper_line(latest, &mut reported_parse_error, &line);
+                }
+                Ok(None) if publish_stopped_on_eof => {
+                    return publish_stopped(latest, "stdout reached EOF");
+                }
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    let _ = publish_stopped(latest, &format!("stdout read error: {error}"));
+                    return Err(error);
+                }
+            }
+        }
+    }
+
     fn terminate_helper_before_ready(child: &mut Child, reader: JoinHandle<()>) {
         let _ = child.kill();
         let _ = child.wait();
@@ -515,9 +602,9 @@ mod platform {
             let reader_latest = Arc::clone(&latest);
             let (ready_tx, ready_rx) = mpsc::channel();
             let reader = thread::spawn(move || {
-                let mut lines = BufReader::new(stdout).lines();
-                match lines.next() {
-                    Some(Ok(line)) => match parse_helper_control_line(&line) {
+                let mut reader = BufReader::new(stdout);
+                match read_bounded_line(&mut reader, MAX_HELPER_JSON_LINE_BYTES) {
+                    Ok(Some(line)) => match parse_helper_control_line(&line) {
                         HelperControlMessage::Ready => {
                             let _ = ready_tx.send(Ok(()));
                         }
@@ -534,42 +621,20 @@ mod platform {
                             return;
                         }
                     },
-                    Some(Err(error)) => {
-                        let _ = ready_tx.send(Err(format!(
-                            "could not read MediaRemote session helper ready message: {error}"
-                        )));
-                        return;
-                    }
-                    None => {
+                    Ok(None) => {
                         let _ = ready_tx.send(Err(
                             "MediaRemote session helper exited before ready".to_owned(),
                         ));
                         return;
                     }
-                }
-                let mut reported_parse_error = false;
-                loop {
-                    match lines.next() {
-                        Some(Ok(line)) => {
-                            process_started_helper_line(
-                                &reader_latest,
-                                &mut reported_parse_error,
-                                &line,
-                            );
-                        }
-                        Some(Err(error)) => {
-                            let _ = publish_stopped(
-                                &reader_latest,
-                                &format!("stdout read error: {error}"),
-                            );
-                            break;
-                        }
-                        None => {
-                            let _ = publish_stopped(&reader_latest, "stdout reached EOF");
-                            break;
-                        }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "could not read MediaRemote session helper ready message: {error}"
+                        )));
+                        return;
                     }
                 }
+                let _ = process_started_helper_stream(&reader_latest, &mut reader, true);
             });
             let ready_error = match ready_rx.recv_timeout(HELPER_READY_TIMEOUT) {
                 Ok(Ok(())) => None,
@@ -939,6 +1004,86 @@ mod platform {
                     .is_playing,
                 Some(false)
             );
+        }
+
+        #[test]
+        fn post_ready_stream_accepts_reset_ready_and_payload_without_eof() {
+            let latest = RwLock::new(Some(ReceivedNowPlaying::from_candidate(
+                Some(&candidate("Old Song", 30.0, 0.0)),
+                None,
+            )));
+            let payload = r#"{"candidates":[{"stableId":"music","bundleId":"com.apple.Music","playing":true,"playingResolved":true,"lastPlayingDate":500.0,"elected":true,"title":"New Song"}]}"#;
+            let mut stream = Cursor::new(format!(
+                "{{\"reset\":\"timeout\"}}\n{{\"ready\":true}}\n{payload}\n"
+            ));
+
+            process_started_helper_stream(&latest, &mut stream, false)
+                .expect("stream lines are processed");
+
+            let latest = latest.read().expect("state lock is readable");
+            let snapshot = &latest.as_ref().expect("payload is published").snapshot;
+            assert_eq!(snapshot.is_playing, Some(true));
+            assert_eq!(snapshot.title.as_deref(), Some("New Song"));
+            assert_eq!(snapshot.bundle_id.as_deref(), Some("com.apple.Music"));
+        }
+
+        #[test]
+        fn bounded_line_reader_rejects_oversized_helper_line_without_growing_past_cap() {
+            let mut stream = Cursor::new(vec![b'a'; 17]);
+
+            let error = read_bounded_line(&mut stream, 16).expect_err("line exceeds cap");
+
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(error
+                .to_string()
+                .contains("helper JSON line exceeded 16 bytes"));
+        }
+
+        #[test]
+        fn oversized_encoded_artwork_is_omitted_without_dropping_candidate() {
+            let candidate =
+                candidate_with_artwork("music", "A".repeat(MAX_ENCODED_ARTWORK_BYTES + 1));
+
+            let received = ReceivedNowPlaying::from_candidate(Some(&candidate), None);
+
+            assert_eq!(received.snapshot.is_playing, Some(true));
+            assert!(received.artwork.is_none());
+            assert_eq!(received.snapshot.artwork_signature, None);
+        }
+
+        #[test]
+        fn oversized_raw_artwork_is_omitted_without_dropping_candidate() {
+            let candidate = candidate_with_artwork(
+                "music",
+                general_purpose::STANDARD.encode(vec![0_u8; MAX_RAW_ARTWORK_BYTES + 1]),
+            );
+
+            let received = ReceivedNowPlaying::from_candidate(Some(&candidate), None);
+
+            assert_eq!(received.snapshot.is_playing, Some(true));
+            assert!(received.artwork.is_none());
+            assert_eq!(received.snapshot.artwork_signature, None);
+        }
+
+        #[test]
+        fn oversized_image_dimensions_are_omitted_without_dropping_candidate() {
+            let image = image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+                MAX_IMAGE_WIDTH + 1,
+                1,
+                Rgba([10, 20, 30, 255]),
+            ));
+            let mut bytes = Vec::new();
+            image
+                .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+                .expect("test image encodes");
+            let candidate =
+                candidate_with_artwork("music", general_purpose::STANDARD.encode(bytes));
+
+            let received = ReceivedNowPlaying::from_candidate(Some(&candidate), None);
+
+            assert_eq!(received.snapshot.is_playing, Some(true));
+            assert!(received.artwork.is_none());
+            assert_eq!(received.snapshot.artwork_signature, None);
         }
     }
 }

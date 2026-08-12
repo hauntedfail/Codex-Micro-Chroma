@@ -29,6 +29,13 @@ static NSData *previousPayloadData = nil;
 static NSMutableDictionary<NSString *, NSDictionary *> *artworkCache = nil;
 static char **helperArgv = NULL;
 
+// MediaRemote is local but untrusted input. These caps cover ordinary album art
+// while bounding callback fan-out, copied payload text, artwork, and JSON size.
+static const NSUInteger MAX_PROCESSED_CLIENTS = 24;
+static const NSUInteger MAX_TEXT_FIELD_BYTES = 8 * 1024;
+static const NSUInteger MAX_RAW_ARTWORK_BYTES = 8 * 1024 * 1024;
+static const NSUInteger MAX_SERIALIZED_ARTWORK_BYTES = 16 * 1024 * 1024;
+
 static id objectProperty(id object, NSString *selectorName) {
     SEL selector = NSSelectorFromString(selectorName);
     if (!object || ![object respondsToSelector:selector]) {
@@ -52,8 +59,30 @@ static long integerProperty(id object, NSString *selectorName, BOOL *present) {
     return (long)((int (*)(id, SEL))objc_msgSend)(object, selector);
 }
 
+static NSString *boundedString(NSString *value) {
+    if (!value) {
+        return nil;
+    }
+    NSData *data = [value dataUsingEncoding:NSUTF8StringEncoding];
+    if (data.length <= MAX_TEXT_FIELD_BYTES) {
+        return value;
+    }
+    NSData *truncated = [data subdataWithRange:NSMakeRange(0, MAX_TEXT_FIELD_BYTES)];
+    NSString *result = [[NSString alloc] initWithData:truncated
+                                             encoding:NSUTF8StringEncoding];
+    while (!result && truncated.length > 0) {
+        truncated = [truncated subdataWithRange:NSMakeRange(0, truncated.length - 1)];
+        result = [[NSString alloc] initWithData:truncated
+                                       encoding:NSUTF8StringEncoding];
+    }
+    return result ?: @"";
+}
+
 static NSString *cachedArtworkData(NSString *stableID, NSData *artwork) {
     if (!stableID || !artwork) {
+        return nil;
+    }
+    if (artwork.length > MAX_RAW_ARTWORK_BYTES) {
         return nil;
     }
     NSDictionary *cached = artworkCache[stableID];
@@ -82,7 +111,7 @@ static void copyString(NSMutableDictionary *destination, NSString *outputKey,
                        NSDictionary *source, NSString *sourceKey) {
     id value = source[sourceKey];
     if ([value isKindOfClass:[NSString class]]) {
-        destination[outputKey] = value;
+        destination[outputKey] = boundedString((NSString *)value);
     }
 }
 
@@ -98,6 +127,7 @@ static void copyNumber(NSMutableDictionary *destination, NSString *outputKey,
 static NSArray *publicCandidates(NSArray *candidates) {
     NSMutableArray *publicCandidates =
         [NSMutableArray arrayWithCapacity:candidates.count];
+    NSUInteger serializedArtworkBytes = 0;
 
     for (NSDictionary *candidate in candidates) {
         if (![candidate isKindOfClass:[NSDictionary class]]) {
@@ -105,6 +135,20 @@ static NSArray *publicCandidates(NSArray *candidates) {
         }
 
         NSMutableDictionary *publicCandidate = [candidate mutableCopy];
+        BOOL playing = [candidate[@"playing"] boolValue];
+        BOOL playingResolved = [candidate[@"playingResolved"] boolValue];
+        NSString *artworkData = publicCandidate[@"artworkData"];
+        if ([artworkData isKindOfClass:[NSString class]]) {
+            NSUInteger artworkBytes =
+                [artworkData lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+            if (!playing || !playingResolved ||
+                artworkBytes > MAX_SERIALIZED_ARTWORK_BYTES ||
+                serializedArtworkBytes + artworkBytes > MAX_SERIALIZED_ARTWORK_BYTES) {
+                [publicCandidate removeObjectForKey:@"artworkData"];
+            } else {
+                serializedArtworkBytes += artworkBytes;
+            }
+        }
         if ([candidate[@"lastPlayingDateError"] boolValue]) {
             [publicCandidate removeObjectForKey:@"lastPlayingDate"];
         }
@@ -196,7 +240,12 @@ static void refreshSessions(void) {
                                : @[];
         dispatch_group_t group = dispatch_group_create();
 
+        NSUInteger processedClients = 0;
         for (id client in clients) {
+            if (processedClients >= MAX_PROCESSED_CLIENTS) {
+                break;
+            }
+            processedClients++;
             dispatch_group_enter(group);
             getPlayerForClient(client, nil, queue, ^(id player) {
                 if (completed) {
@@ -217,13 +266,14 @@ static void refreshSessions(void) {
                     return;
                 }
 
-                NSString *bundleID =
+                NSString *bundleID = boundedString(
                     stringProperty(client, @"parentApplicationBundleIdentifier")
                         ?: stringProperty(client, @"bundleIdentifier")
-                        ?: @"unknown";
-                NSString *playerID = stringProperty(player, @"identifier")
-                                         ?: stringProperty(player, @"displayName")
-                                         ?: @"default";
+                        ?: @"unknown");
+                NSString *playerID =
+                    boundedString(stringProperty(player, @"identifier")
+                                  ?: stringProperty(player, @"displayName")
+                                  ?: @"default");
                 BOOL hasProcessIdentifier = NO;
                 long processIdentifier = integerProperty(
                     client, @"processIdentifier", &hasProcessIdentifier);
