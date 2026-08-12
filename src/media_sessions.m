@@ -501,7 +501,7 @@ static void copyMetadata(NSMutableDictionary *entry, NSDictionary *information,
         NSNumber *rate = entry[@"playbackRate"];
         if ([rate isKindOfClass:[NSNumber class]] &&
             isfinite([rate doubleValue])) {
-            entry[@"playing"] = @([rate doubleValue] > 0.0);
+            entry[@"playing"] = @([rate doubleValue] != 0.0);
             entry[@"playingResolved"] = @YES;
         }
     }
@@ -1657,7 +1657,10 @@ static int runSmokeTests(void) {
             @{ @"kMRMediaRemoteNowPlayingInfoPlaybackRate" : @1.0 }, YES,
             YES) ||
         !smokeFallbackRateResolves(
-            @{ @"kMRMediaRemoteNowPlayingInfoPlaybackRate" : @-1.0 }, NO,
+            @{ @"kMRMediaRemoteNowPlayingInfoPlaybackRate" : @-1.0 }, YES,
+            YES) ||
+        !smokeFallbackRateResolves(
+            @{ @"kMRMediaRemoteNowPlayingInfoPlaybackRate" : @-0.0 }, NO,
             YES)) {
         fprintf(stderr, "metadata fallback playbackRate resolution failed\n");
         return 1;
