@@ -263,11 +263,18 @@ mod platform {
         }
     }
 
+    #[derive(Clone)]
     struct ReceivedNowPlaying {
         snapshot: TrackSnapshot,
         artwork: Option<CachedArtwork>,
         position_at_received: Option<f64>,
         received_at: Instant,
+    }
+
+    #[derive(Default)]
+    struct NowPlayingState {
+        latest: Option<ReceivedNowPlaying>,
+        pending_reset: Option<ReceivedNowPlaying>,
     }
 
     struct CachedArtwork {
@@ -444,20 +451,30 @@ mod platform {
             && left.album == right.album
     }
 
+    enum StoppedDelivery {
+        Authoritative,
+        OneShotReset,
+    }
+
     fn publish_stopped(
-        latest: &RwLock<Option<ReceivedNowPlaying>>,
+        state: &RwLock<NowPlayingState>,
         reason: &str,
+        delivery: StoppedDelivery,
     ) -> std::io::Result<()> {
-        let mut latest = latest
+        let mut state = state
             .write()
             .map_err(|_| std::io::Error::other("MediaRemote state lock is poisoned"))?;
-        *latest = Some(ReceivedNowPlaying::from_candidate(None, latest.as_ref()));
+        let stopped = ReceivedNowPlaying::from_candidate(None, state.latest.as_ref());
+        state.latest = Some(stopped.clone());
+        if matches!(delivery, StoppedDelivery::OneShotReset) {
+            state.pending_reset = Some(stopped);
+        }
         eprintln!("MediaRemote session helper stopped: {reason}; clearing Now Playing state");
         Ok(())
     }
 
     fn process_started_helper_line(
-        latest: &RwLock<Option<ReceivedNowPlaying>>,
+        state: &RwLock<NowPlayingState>,
         reported_parse_error: &mut bool,
         line: &str,
     ) {
@@ -467,7 +484,7 @@ mod platform {
             }
             HelperControlMessage::Reset { reason } => {
                 let reason = reason.as_deref().unwrap_or("control reset requested");
-                let _ = publish_stopped(latest, reason);
+                let _ = publish_stopped(state, reason, StoppedDelivery::OneShotReset);
                 return;
             }
             HelperControlMessage::Invalid(_) => {}
@@ -483,10 +500,10 @@ mod platform {
             }
         };
         let selected = select_playback_candidate(&payload.candidates);
-        if let Ok(mut latest) = latest.write() {
-            *latest = Some(ReceivedNowPlaying::from_candidate(
+        if let Ok(mut state) = state.write() {
+            state.latest = Some(ReceivedNowPlaying::from_candidate(
                 selected,
-                latest.as_ref(),
+                state.latest.as_ref(),
             ));
         }
     }
@@ -535,7 +552,7 @@ mod platform {
     }
 
     fn process_started_helper_stream<R: BufRead>(
-        latest: &RwLock<Option<ReceivedNowPlaying>>,
+        state: &RwLock<NowPlayingState>,
         reader: &mut R,
         publish_stopped_on_eof: bool,
     ) -> std::io::Result<()> {
@@ -543,18 +560,60 @@ mod platform {
         loop {
             match read_bounded_line(reader, MAX_HELPER_JSON_LINE_BYTES) {
                 Ok(Some(line)) => {
-                    process_started_helper_line(latest, &mut reported_parse_error, &line);
+                    process_started_helper_line(state, &mut reported_parse_error, &line);
                 }
                 Ok(None) if publish_stopped_on_eof => {
-                    return publish_stopped(latest, "stdout reached EOF");
+                    return publish_stopped(
+                        state,
+                        "stdout reached EOF",
+                        StoppedDelivery::Authoritative,
+                    );
                 }
                 Ok(None) => return Ok(()),
                 Err(error) => {
-                    let _ = publish_stopped(latest, &format!("stdout read error: {error}"));
+                    let _ = publish_stopped(
+                        state,
+                        &format!("stdout read error: {error}"),
+                        StoppedDelivery::Authoritative,
+                    );
                     return Err(error);
                 }
             }
         }
+    }
+
+    fn snapshot_from_state(
+        state: &RwLock<NowPlayingState>,
+        artwork_delivery: &RefCell<ArtworkDelivery>,
+    ) -> Option<TrackSnapshot> {
+        let (received, from_reset) = {
+            let mut state = state.write().ok()?;
+            if let Some(received) = state.pending_reset.take() {
+                (received, true)
+            } else {
+                (state.latest.as_ref()?.clone(), false)
+            }
+        };
+        if from_reset {
+            artwork_delivery.borrow_mut().invalidate();
+        }
+        let key = received.snapshot.track_key();
+        let should_copy_artwork = artwork_delivery
+            .borrow_mut()
+            .should_deliver(key.as_deref(), !from_reset && received.artwork.is_some());
+        let mut snapshot = TrackSnapshot {
+            artwork: if should_copy_artwork {
+                received
+                    .artwork
+                    .as_ref()
+                    .map(|artwork| (*artwork.image).clone())
+            } else {
+                None
+            },
+            ..received.snapshot.clone_without_artwork()
+        };
+        snapshot.elapsed_time = received.elapsed_time();
+        Some(snapshot)
     }
 
     fn terminate_helper_before_ready(child: &mut Child, reader: JoinHandle<()>) {
@@ -567,7 +626,7 @@ mod platform {
         child: Child,
         reader: Option<JoinHandle<()>>,
         _temp_dir: TempDir,
-        latest: Arc<RwLock<Option<ReceivedNowPlaying>>>,
+        state: Arc<RwLock<NowPlayingState>>,
         artwork_delivery: RefCell<ArtworkDelivery>,
     }
 
@@ -598,8 +657,8 @@ mod platform {
                 .stdout
                 .take()
                 .context("MediaRemote session helper stdout is unavailable")?;
-            let latest = Arc::new(RwLock::new(None::<ReceivedNowPlaying>));
-            let reader_latest = Arc::clone(&latest);
+            let state = Arc::new(RwLock::new(NowPlayingState::default()));
+            let reader_state = Arc::clone(&state);
             let (ready_tx, ready_rx) = mpsc::channel();
             let reader = thread::spawn(move || {
                 let mut reader = BufReader::new(stdout);
@@ -634,7 +693,7 @@ mod platform {
                         return;
                     }
                 }
-                let _ = process_started_helper_stream(&reader_latest, &mut reader, true);
+                let _ = process_started_helper_stream(&reader_state, &mut reader, true);
             });
             let ready_error = match ready_rx.recv_timeout(HELPER_READY_TIMEOUT) {
                 Ok(Ok(())) => None,
@@ -654,32 +713,13 @@ mod platform {
                 child,
                 reader: Some(reader),
                 _temp_dir: temp_dir,
-                latest,
+                state,
                 artwork_delivery: RefCell::new(ArtworkDelivery::default()),
             })
         }
 
         pub fn snapshot(&self) -> Option<TrackSnapshot> {
-            let guard = self.latest.read().ok()?;
-            let received = guard.as_ref()?;
-            let key = received.snapshot.track_key();
-            let should_copy_artwork = self
-                .artwork_delivery
-                .borrow_mut()
-                .should_deliver(key.as_deref(), received.artwork.is_some());
-            let mut snapshot = TrackSnapshot {
-                artwork: if should_copy_artwork {
-                    received
-                        .artwork
-                        .as_ref()
-                        .map(|artwork| (*artwork.image).clone())
-                } else {
-                    None
-                },
-                ..received.snapshot.clone_without_artwork()
-            };
-            snapshot.elapsed_time = received.elapsed_time();
-            Some(snapshot)
+            snapshot_from_state(&self.state, &self.artwork_delivery)
         }
 
         pub fn invalidate_artwork_delivery(&self) {
@@ -800,21 +840,27 @@ mod platform {
 
         #[test]
         fn publish_stopped_overwrites_a_cached_playing_snapshot() {
-            let latest = RwLock::new(Some(ReceivedNowPlaying::from_candidate(
-                Some(&candidate("Song", 30.0, 0.0)),
-                None,
-            )));
+            let state = RwLock::new(NowPlayingState {
+                latest: Some(ReceivedNowPlaying::from_candidate(
+                    Some(&candidate("Song", 30.0, 0.0)),
+                    None,
+                )),
+                pending_reset: None,
+            });
 
-            publish_stopped(&latest, "test termination").expect("state update succeeds");
+            publish_stopped(&state, "test termination", StoppedDelivery::Authoritative)
+                .expect("state update succeeds");
 
-            let latest = latest.read().expect("state lock is readable");
-            let snapshot = &latest
+            let state = state.read().expect("state lock is readable");
+            let snapshot = &state
+                .latest
                 .as_ref()
                 .expect("stopped state is published")
                 .snapshot;
             assert_eq!(snapshot.is_playing, Some(false));
             assert_eq!(snapshot.title.as_deref(), Some("Song"));
             assert!(snapshot.artwork.is_none());
+            assert!(state.pending_reset.is_none());
         }
 
         #[test]
@@ -956,48 +1002,57 @@ mod platform {
 
         #[test]
         fn reset_control_line_after_ready_clears_cached_playing_state() {
-            let latest = RwLock::new(Some(ReceivedNowPlaying::from_candidate(
-                Some(&candidate("Song", 30.0, 0.0)),
-                None,
-            )));
+            let state = RwLock::new(NowPlayingState {
+                latest: Some(ReceivedNowPlaying::from_candidate(
+                    Some(&candidate("Song", 30.0, 0.0)),
+                    None,
+                )),
+                pending_reset: None,
+            });
             let mut reported_parse_error = false;
 
             process_started_helper_line(
-                &latest,
+                &state,
                 &mut reported_parse_error,
                 r#"{"reset":"timeout"}"#,
             );
 
             assert!(!reported_parse_error);
-            let latest = latest.read().expect("state lock is readable");
-            let snapshot = &latest
+            let state = state.read().expect("state lock is readable");
+            let snapshot = &state
+                .latest
                 .as_ref()
                 .expect("stopped state is published")
                 .snapshot;
             assert_eq!(snapshot.is_playing, Some(false));
             assert_eq!(snapshot.title.as_deref(), Some("Song"));
             assert!(snapshot.artwork.is_none());
+            assert!(state.pending_reset.is_some());
         }
 
         #[test]
         fn ready_control_line_after_reset_is_not_reported_as_parse_error() {
-            let latest = RwLock::new(Some(ReceivedNowPlaying::from_candidate(
-                Some(&candidate("Song", 30.0, 0.0)),
-                None,
-            )));
+            let state = RwLock::new(NowPlayingState {
+                latest: Some(ReceivedNowPlaying::from_candidate(
+                    Some(&candidate("Song", 30.0, 0.0)),
+                    None,
+                )),
+                pending_reset: None,
+            });
             let mut reported_parse_error = false;
 
             process_started_helper_line(
-                &latest,
+                &state,
                 &mut reported_parse_error,
                 r#"{"reset":"timeout"}"#,
             );
-            process_started_helper_line(&latest, &mut reported_parse_error, r#"{"ready":true}"#);
+            process_started_helper_line(&state, &mut reported_parse_error, r#"{"ready":true}"#);
 
             assert!(!reported_parse_error);
-            let latest = latest.read().expect("state lock is readable");
+            let state = state.read().expect("state lock is readable");
             assert_eq!(
-                latest
+                state
+                    .latest
                     .as_ref()
                     .expect("state remains published")
                     .snapshot
@@ -1008,23 +1063,136 @@ mod platform {
 
         #[test]
         fn post_ready_stream_accepts_reset_ready_and_payload_without_eof() {
-            let latest = RwLock::new(Some(ReceivedNowPlaying::from_candidate(
-                Some(&candidate("Old Song", 30.0, 0.0)),
-                None,
-            )));
+            let state = RwLock::new(NowPlayingState {
+                latest: Some(ReceivedNowPlaying::from_candidate(
+                    Some(&candidate("Old Song", 30.0, 0.0)),
+                    None,
+                )),
+                pending_reset: None,
+            });
             let payload = r#"{"candidates":[{"stableId":"music","bundleId":"com.apple.Music","playing":true,"playingResolved":true,"lastPlayingDate":500.0,"elected":true,"title":"New Song"}]}"#;
             let mut stream = Cursor::new(format!(
                 "{{\"reset\":\"timeout\"}}\n{{\"ready\":true}}\n{payload}\n"
             ));
 
-            process_started_helper_stream(&latest, &mut stream, false)
+            process_started_helper_stream(&state, &mut stream, false)
                 .expect("stream lines are processed");
 
-            let latest = latest.read().expect("state lock is readable");
-            let snapshot = &latest.as_ref().expect("payload is published").snapshot;
+            let state = state.read().expect("state lock is readable");
+            let snapshot = &state
+                .latest
+                .as_ref()
+                .expect("payload is published")
+                .snapshot;
             assert_eq!(snapshot.is_playing, Some(true));
             assert_eq!(snapshot.title.as_deref(), Some("New Song"));
             assert_eq!(snapshot.bundle_id.as_deref(), Some("com.apple.Music"));
+        }
+
+        #[test]
+        fn reset_delivery_is_sticky_until_snapshot_observes_it() {
+            let state = RwLock::new(NowPlayingState {
+                latest: Some(ReceivedNowPlaying::from_candidate(
+                    Some(&candidate("Old Song", 30.0, 0.0)),
+                    None,
+                )),
+                pending_reset: None,
+            });
+            let artwork_delivery = RefCell::new(ArtworkDelivery::default());
+            let mut reported_parse_error = false;
+            let replacement = r#"{"candidates":[{"stableId":"music","bundleId":"com.apple.Music","playing":true,"playingResolved":true,"lastPlayingDate":500.0,"elected":true,"title":"New Song"}]}"#;
+
+            process_started_helper_line(
+                &state,
+                &mut reported_parse_error,
+                r#"{"reset":"timeout"}"#,
+            );
+            process_started_helper_line(&state, &mut reported_parse_error, replacement);
+
+            let stopped =
+                snapshot_from_state(&state, &artwork_delivery).expect("reset is delivered first");
+            let playing = snapshot_from_state(&state, &artwork_delivery)
+                .expect("replacement is delivered after reset");
+
+            assert!(!reported_parse_error);
+            assert_eq!(stopped.is_playing, Some(false));
+            assert_eq!(stopped.title.as_deref(), Some("Old Song"));
+            assert!(stopped.artwork.is_none());
+            assert_eq!(playing.is_playing, Some(true));
+            assert_eq!(playing.title.as_deref(), Some("New Song"));
+        }
+
+        #[test]
+        fn multiple_resets_coalesce_into_one_stopped_snapshot() {
+            let state = RwLock::new(NowPlayingState {
+                latest: Some(ReceivedNowPlaying::from_candidate(
+                    Some(&candidate("Song", 30.0, 0.0)),
+                    None,
+                )),
+                pending_reset: None,
+            });
+            let artwork_delivery = RefCell::new(ArtworkDelivery::default());
+            let mut reported_parse_error = false;
+
+            process_started_helper_line(
+                &state,
+                &mut reported_parse_error,
+                r#"{"reset":"timeout"}"#,
+            );
+            process_started_helper_line(
+                &state,
+                &mut reported_parse_error,
+                r#"{"reset":"timeout"}"#,
+            );
+
+            let stopped =
+                snapshot_from_state(&state, &artwork_delivery).expect("coalesced reset is present");
+            let next = snapshot_from_state(&state, &artwork_delivery)
+                .expect("latest state remains present");
+
+            assert!(!reported_parse_error);
+            assert_eq!(stopped.is_playing, Some(false));
+            assert!(stopped.artwork.is_none());
+            assert_eq!(next.is_playing, Some(false));
+        }
+
+        #[test]
+        fn reset_snapshot_omits_artwork_and_allows_replacement_redelivery() {
+            let encoded_artwork = encoded_artwork(10, 20, 30);
+            let playing = ReceivedNowPlaying::from_candidate(
+                Some(&candidate_with_artwork("music", encoded_artwork.clone())),
+                None,
+            );
+            let state = RwLock::new(NowPlayingState {
+                latest: Some(playing),
+                pending_reset: None,
+            });
+            let artwork_delivery = RefCell::new(ArtworkDelivery::default());
+            let mut reported_parse_error = false;
+            let initial =
+                snapshot_from_state(&state, &artwork_delivery).expect("initial artwork snapshot");
+            let replacement = format!(
+                r#"{{"candidates":[{{"stableId":"music","bundleId":"com.apple.Music","playing":true,"playingResolved":true,"lastPlayingDate":500.0,"elected":true,"title":"Song","artist":"Artist","album":"Album","artworkData":"{encoded_artwork}"}}]}}"#
+            );
+
+            process_started_helper_line(
+                &state,
+                &mut reported_parse_error,
+                r#"{"reset":"timeout"}"#,
+            );
+            process_started_helper_line(&state, &mut reported_parse_error, &replacement);
+
+            let stopped =
+                snapshot_from_state(&state, &artwork_delivery).expect("reset is delivered first");
+            let redelivered = snapshot_from_state(&state, &artwork_delivery)
+                .expect("replacement is delivered after reset");
+
+            assert!(!reported_parse_error);
+            assert!(initial.artwork.is_some());
+            assert_eq!(stopped.is_playing, Some(false));
+            assert!(stopped.artwork.is_none());
+            assert_eq!(redelivered.is_playing, Some(true));
+            assert!(redelivered.artwork.is_some());
         }
 
         #[test]
