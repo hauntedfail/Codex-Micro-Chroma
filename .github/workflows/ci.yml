@@ -36,6 +36,22 @@ jobs:
             aarch64-apple-darwin \
             x86_64-apple-darwin
 
+      - name: Smoke test Objective-C media helper
+        run: |
+          set -euo pipefail
+          smoke_executable="${RUNNER_TEMP}/codex_micro_chroma_media_sessions_smoke"
+          /usr/bin/xcrun clang \
+            -fobjc-arc \
+            -fblocks \
+            -Wall \
+            -Wextra \
+            -Werror \
+            -DMEDIA_SESSIONS_SMOKE \
+            -framework Foundation \
+            src/media_sessions.m \
+            -o "$smoke_executable"
+          "$smoke_executable"
+
       - name: Check formatting
         run: cargo +"$RUST_TOOLCHAIN" fmt --all --check
 
