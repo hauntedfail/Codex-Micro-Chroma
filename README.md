@@ -49,10 +49,10 @@ Exactly one HID interface matching the Codex Micro is required. No matching devi
 
 ## Download
 
-The current release is **v0.1.0**. Download the universal macOS archive and its SHA-256 checksum from GitHub Releases:
+The current release is **v0.2.0**. Download the universal macOS archive and its SHA-256 checksum from GitHub Releases:
 
 ```bash
-VERSION=0.1.0
+VERSION=0.2.0
 BASE_URL="https://github.com/hauntedfail/Codex-Micro-Chroma/releases/download/v${VERSION}"
 ARCHIVE="codex-micro-chroma-v${VERSION}-macos-universal.tar.gz"
 
@@ -267,7 +267,7 @@ cargo test --all-targets --all-features
 
 The `Release macOS binary` GitHub Actions workflow builds an ad-hoc-signed universal binary, creates a checksum, and publishes both files in a new GitHub Release. The requested version must match the `version` in `Cargo.toml`.
 
-To publish manually, open **Actions > Release macOS binary > Run workflow** and enter a version without the leading `v`, such as `0.1.0`. Alternatively, push a matching tag such as `v0.1.0`.
+To publish manually, open **Actions > Release macOS binary > Run workflow** and enter a version without the leading `v`, such as `0.2.0`. Alternatively, push a matching tag such as `v0.2.0`.
 
 An existing release or manually supplied existing tag is never overwritten. Update `Cargo.toml` and the version shown in the Download section before publishing the next version.
 
