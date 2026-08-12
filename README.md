@@ -11,7 +11,7 @@ Lighting effects and brightness respond dynamically to the audio's musical dynam
 ```text
 macOS Now Playing (Music / Spotify / browser / other players)
   -> macOS MediaRemote
-  -> Apple-signed /usr/bin/perl + embedded per-player session adapter
+  -> ad-hoc signed embedded per-player session helper
   -> active-session arbitration from macOS-owned state
   -> local image decoding and representative-colour extraction
   -> artwork colour
@@ -36,7 +36,6 @@ When several applications publish Now Playing sessions simultaneously, Codex Mic
 - A connected Work Louder Codex Micro
 - Rust 1.88 or later
 - Xcode Command Line Tools
-- The standard macOS `/usr/bin/perl`
 
 ## Compatibility and current status
 

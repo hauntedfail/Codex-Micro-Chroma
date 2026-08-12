@@ -199,9 +199,9 @@ mod platform {
         cell::RefCell,
         fs,
         io::{BufRead, BufReader},
-        path::Path,
+        os::unix::fs::PermissionsExt,
         process::{Child, Command, Stdio},
-        sync::{Arc, RwLock},
+        sync::{mpsc, Arc, RwLock},
         thread::{self, JoinHandle},
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
@@ -216,15 +216,35 @@ mod platform {
         PlaybackCandidate, TrackSnapshot,
     };
 
-    const MEDIA_SESSIONS_DYLIB: &[u8] = include_bytes!(concat!(
+    const MEDIA_SESSIONS_HELPER: &[u8] = include_bytes!(concat!(
         env!("OUT_DIR"),
-        "/libcodex_micro_chroma_media_sessions.dylib"
+        "/codex_micro_chroma_media_sessions"
     ));
-    const MEDIA_SESSIONS_PERL: &str = include_str!("media_sessions.pl");
+    const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
     #[derive(Deserialize)]
     struct SessionPayload {
         candidates: Vec<PlaybackCandidate>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum HelperControlMessage {
+        Ready,
+        Invalid(String),
+    }
+
+    fn parse_helper_control_line(line: &str) -> HelperControlMessage {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(serde_json::Value::Object(map))
+                if map
+                    .get("ready")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false) =>
+            {
+                HelperControlMessage::Ready
+            }
+            _ => HelperControlMessage::Invalid(line.to_owned()),
+        }
     }
 
     struct ReceivedNowPlaying {
@@ -416,24 +436,22 @@ mod platform {
 
     impl MediaRemoteSource {
         pub fn new() -> Result<Self> {
-            if !Path::new("/usr/bin/perl").is_file() {
-                bail!("macOS system Perl was not found at /usr/bin/perl");
-            }
-
             let temp_dir = tempfile::Builder::new()
                 .prefix("codex-micro-chroma-media-sessions")
                 .tempdir()
                 .context("could not create MediaRemote helper directory")?;
-            let dylib_path = temp_dir.path().join("media_sessions.dylib");
-            let perl_path = temp_dir.path().join("media_sessions.pl");
-            fs::write(&dylib_path, MEDIA_SESSIONS_DYLIB)
+            let helper_path = temp_dir.path().join("media_sessions");
+            fs::write(&helper_path, MEDIA_SESSIONS_HELPER)
                 .context("could not extract MediaRemote session helper")?;
-            fs::write(&perl_path, MEDIA_SESSIONS_PERL)
-                .context("could not extract MediaRemote Perl shim")?;
+            let mut permissions = fs::metadata(&helper_path)
+                .context("could not stat MediaRemote session helper")?
+                .permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&helper_path, permissions)
+                .context("could not make MediaRemote session helper executable")?;
 
-            let mut child = Command::new("/usr/bin/perl")
-                .arg(&perl_path)
-                .arg(&dylib_path)
+            let mut child = Command::new(&helper_path)
+                .env_clear()
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -445,8 +463,34 @@ mod platform {
                 .context("MediaRemote session helper stdout is unavailable")?;
             let latest = Arc::new(RwLock::new(None::<ReceivedNowPlaying>));
             let reader_latest = Arc::clone(&latest);
+            let (ready_tx, ready_rx) = mpsc::channel();
             let reader = thread::spawn(move || {
                 let mut lines = BufReader::new(stdout).lines();
+                match lines.next() {
+                    Some(Ok(line)) => match parse_helper_control_line(&line) {
+                        HelperControlMessage::Ready => {
+                            let _ = ready_tx.send(Ok(()));
+                        }
+                        HelperControlMessage::Invalid(line) => {
+                            let _ = ready_tx.send(Err(format!(
+                                "malformed pre-ready output from MediaRemote session helper: {line}"
+                            )));
+                            return;
+                        }
+                    },
+                    Some(Err(error)) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "could not read MediaRemote session helper ready message: {error}"
+                        )));
+                        return;
+                    }
+                    None => {
+                        let _ = ready_tx.send(Err(
+                            "MediaRemote session helper exited before ready".to_owned(),
+                        ));
+                        return;
+                    }
+                }
                 loop {
                     match lines.next() {
                         Some(Ok(line)) => {
@@ -475,6 +519,27 @@ mod platform {
                     }
                 }
             });
+            match ready_rx.recv_timeout(HELPER_READY_TIMEOUT) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    bail!("{error}");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    bail!("MediaRemote session helper did not become ready within {HELPER_READY_TIMEOUT:?}");
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    bail!("MediaRemote session helper reader stopped before ready");
+                }
+            }
             Ok(Self {
                 child,
                 reader: Some(reader),
@@ -693,6 +758,30 @@ mod platform {
             assert!(stopped.snapshot.artwork_signature.is_some());
             assert!(stopped.snapshot.artwork.is_none());
         }
+
+        #[test]
+        fn helper_control_line_accepts_ready_message() {
+            assert_eq!(
+                parse_helper_control_line(r#"{"ready":true}"#),
+                HelperControlMessage::Ready
+            );
+        }
+
+        #[test]
+        fn helper_control_line_rejects_session_payload_before_ready() {
+            assert_eq!(
+                parse_helper_control_line(r#"{"candidates":[]}"#),
+                HelperControlMessage::Invalid(r#"{"candidates":[]}"#.to_owned())
+            );
+        }
+
+        #[test]
+        fn helper_control_line_rejects_malformed_before_ready() {
+            assert_eq!(
+                parse_helper_control_line("not json"),
+                HelperControlMessage::Invalid("not json".to_owned())
+            );
+        }
     }
 }
 
@@ -849,7 +938,7 @@ mod tests {
                 "title":"Song"
             }"#,
         )
-        .expect("valid adapter payload");
+        .expect("valid helper payload");
 
         assert_eq!(candidate.bundle_id.as_deref(), Some("com.apple.Music"));
         assert_eq!(candidate.last_playing_date, Some(123.5));

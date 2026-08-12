@@ -1,5 +1,4 @@
 use std::{
-    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU16, Ordering},
         Arc,
@@ -172,11 +171,6 @@ fn main() -> Result<()> {
 }
 
 fn probe() -> Result<()> {
-    if !Path::new("/usr/bin/perl").is_file() {
-        bail!("MediaRemote host /usr/bin/perl is missing");
-    }
-    println!("Perl adapter host: /usr/bin/perl");
-
     let device = hid::probe().context("Codex Micro HID probe failed")?;
     println!(
         "Codex Micro HID: {}{}",
@@ -196,7 +190,7 @@ fn probe() -> Result<()> {
             snapshot.title.as_deref().unwrap_or("unknown title"),
             snapshot.bundle_id.as_deref().unwrap_or("unknown app")
         ),
-        None => println!("MediaRemote: adapter started; play a song to verify a payload"),
+        None => println!("MediaRemote: helper started; play a song to verify a payload"),
     }
     println!("SIP changes: not required");
     Ok(())

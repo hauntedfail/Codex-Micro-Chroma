@@ -7,7 +7,6 @@ fn main() {
     println!("cargo:rerun-if-changed=src/process_tap.h");
     println!("cargo:rerun-if-changed=src/process_tap.m");
     println!("cargo:rerun-if-changed=src/media_sessions.m");
-    println!("cargo:rerun-if-changed=src/media_sessions.pl");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
@@ -21,17 +20,16 @@ fn main() {
         .compile("codex_micro_chroma_process_tap");
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
-    let helper = out_dir.join("libcodex_micro_chroma_media_sessions.dylib");
+    let helper = out_dir.join("codex_micro_chroma_media_sessions");
     let target_arch = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
         Ok("aarch64") => "arm64",
         Ok("x86_64") => "x86_64",
         Ok(other) => panic!("unsupported macOS target architecture: {other}"),
         Err(error) => panic!("missing target architecture: {error}"),
     };
-    let clang_status = Command::new("xcrun")
+    let clang_status = Command::new("/usr/bin/xcrun")
         .args([
             "clang",
-            "-dynamiclib",
             "-fobjc-arc",
             "-fblocks",
             "-Wall",
@@ -53,7 +51,7 @@ fn main() {
         "failed to compile MediaRemote session helper"
     );
 
-    let codesign_status = Command::new("codesign")
+    let codesign_status = Command::new("/usr/bin/codesign")
         .args(["--force", "--sign", "-"])
         .arg(&helper)
         .status()

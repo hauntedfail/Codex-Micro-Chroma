@@ -85,9 +85,39 @@ static void copyString(NSMutableDictionary *destination, NSString *outputKey,
 static void copyNumber(NSMutableDictionary *destination, NSString *outputKey,
                        NSDictionary *source, NSString *sourceKey) {
     id value = source[sourceKey];
-    if ([value isKindOfClass:[NSNumber class]]) {
+    if ([value isKindOfClass:[NSNumber class]] &&
+        isfinite([(NSNumber *)value doubleValue])) {
         destination[outputKey] = value;
     }
+}
+
+static NSArray *publicCandidatesIfComplete(NSArray *candidates, BOOL *complete) {
+    NSMutableArray *publicCandidates =
+        [NSMutableArray arrayWithCapacity:candidates.count];
+    BOOL valid = YES;
+
+    for (NSDictionary *candidate in candidates) {
+        if (![candidate isKindOfClass:[NSDictionary class]]) {
+            valid = NO;
+            continue;
+        }
+
+        BOOL playing = [candidate[@"playing"] boolValue];
+        if (playing) {
+            if (![candidate[@"metadataResolved"] boolValue] ||
+                [candidate[@"lastPlayingDateError"] boolValue]) {
+                valid = NO;
+            }
+        }
+
+        NSMutableDictionary *publicCandidate = [candidate mutableCopy];
+        [publicCandidate removeObjectForKey:@"metadataResolved"];
+        [publicCandidate removeObjectForKey:@"lastPlayingDateError"];
+        [publicCandidates addObject:publicCandidate];
+    }
+
+    *complete = valid;
+    return publicCandidates;
 }
 
 static void printCandidates(NSArray *candidates) {
@@ -134,8 +164,13 @@ static void refreshSessions(void) {
       }
       completed = YES;
       if (!timedOut && refreshValid) {
-          printCandidates(candidates);
-          pruneArtworkCache(activeStableIDs);
+          BOOL candidatesComplete = NO;
+          NSArray *publicCandidates =
+              publicCandidatesIfComplete(candidates, &candidatesComplete);
+          if (candidatesComplete) {
+              printCandidates(publicCandidates);
+              pruneArtworkCache(activeStableIDs);
+          }
       }
       refreshInFlight = NO;
       scheduleRefresh();
@@ -201,6 +236,8 @@ static void refreshSessions(void) {
                     @"bundleId" : bundleID,
                     @"playing" : @NO,
                     @"playingResolved" : @NO,
+                    @"metadataResolved" : @NO,
+                    @"lastPlayingDateError" : @NO,
                     @"elected" : @([playerPath isEqual:electedPath]),
                 } mutableCopy];
                 [candidates addObject:entry];
@@ -222,6 +259,7 @@ static void refreshSessions(void) {
                       return;
                   }
                   if ([information isKindOfClass:[NSDictionary class]]) {
+                      entry[@"metadataResolved"] = @YES;
                       copyString(entry, @"title", information,
                                  @"kMRMediaRemoteNowPlayingInfoTitle");
                       copyString(entry, @"artist", information,
@@ -297,7 +335,7 @@ static void refreshSessions(void) {
                                     return;
                                 }
                                 if (error) {
-                                    refreshValid = NO;
+                                    entry[@"lastPlayingDateError"] = @YES;
                                 } else if ([date isKindOfClass:[NSDate class]]) {
                                     entry[@"lastPlayingDate"] =
                                         @([date timeIntervalSince1970]);
@@ -326,13 +364,18 @@ static void scheduleRefresh(void) {
         });
 }
 
-__attribute__((visibility("default"))) void chroma_media_sessions_stream(void) {
+static void printReady(void) {
+    printf("{\"ready\":true}\n");
+    fflush(stdout);
+}
+
+int main(void) {
     @autoreleasepool {
         NSBundle *framework = [NSBundle bundleWithPath:
             @"/System/Library/PrivateFrameworks/MediaRemote.framework"];
         if (![framework load]) {
             fprintf(stderr, "could not load MediaRemote.framework\n");
-            return;
+            return 1;
         }
 
         getNowPlayingClients = (MRGetNowPlayingClients)dlsym(
@@ -343,15 +386,25 @@ __attribute__((visibility("default"))) void chroma_media_sessions_stream(void) {
             RTLD_DEFAULT, "MRMediaRemoteGetNowPlayingInfoForPlayer");
         if (!getNowPlayingClients || !getPlayerForClient || !getInfoForPlayer) {
             fprintf(stderr, "required per-player MediaRemote symbols are unavailable\n");
-            return;
+            return 1;
         }
         requestQueue = dispatch_queue_create(
             "com.local.codex-micro-chroma.media-sessions", DISPATCH_QUEUE_SERIAL);
         artworkCache = [NSMutableDictionary dictionary];
 
         Class requestClass = NSClassFromString(@"MRNowPlayingRequest");
-        if (!requestClass ||
-            !class_getInstanceMethod(
+        if (!requestClass) {
+            fprintf(stderr, "MRNowPlayingRequest is unavailable\n");
+            return 1;
+        }
+        if (!class_getInstanceMethod(
+                requestClass,
+                NSSelectorFromString(@"requestIsPlayingOnQueue:completion:"))) {
+            fprintf(stderr,
+                    "MediaRemote scoped playing requests are unavailable; "
+                    "playbackRate will be used as the playing fallback\n");
+        }
+        if (!class_getInstanceMethod(
                 requestClass,
                 NSSelectorFromString(@"requestLastPlayingDateOnQueue:completion:"))) {
             fprintf(stderr,
@@ -359,6 +412,7 @@ __attribute__((visibility("default"))) void chroma_media_sessions_stream(void) {
                     "OS election will be used as the tie-breaker\n");
         }
 
+        printReady();
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{
@@ -366,4 +420,5 @@ __attribute__((visibility("default"))) void chroma_media_sessions_stream(void) {
             });
         CFRunLoopRun();
     }
+    return 0;
 }
