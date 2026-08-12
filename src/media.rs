@@ -642,6 +642,25 @@ mod platform {
             }
         }
 
+        fn identity_only_candidate(stable_id: &str, bundle_id: &str) -> PlaybackCandidate {
+            PlaybackCandidate {
+                stable_id: stable_id.into(),
+                bundle_id: Some(bundle_id.into()),
+                playing: true,
+                playing_resolved: true,
+                last_playing_date: Some(200.0),
+                elected: true,
+                title: None,
+                artist: None,
+                album: None,
+                elapsed_time: None,
+                duration: None,
+                playback_rate: None,
+                info_update_date: None,
+                artwork_data: None,
+            }
+        }
+
         #[test]
         fn stopped_state_preserves_identity_without_artwork_for_resume() {
             let playing =
@@ -766,6 +785,38 @@ mod platform {
             assert!(stopped.artwork.is_none());
             assert!(stopped.snapshot.artwork_signature.is_some());
             assert!(stopped.snapshot.artwork.is_none());
+        }
+
+        #[test]
+        fn identity_only_playing_candidate_clears_stale_metadata_and_artwork() {
+            let playing = ReceivedNowPlaying::from_candidate(
+                Some(&candidate_with_artwork(
+                    "music",
+                    encoded_artwork(10, 20, 30),
+                )),
+                None,
+            );
+
+            let identity_only = ReceivedNowPlaying::from_candidate(
+                Some(&identity_only_candidate("music", "com.apple.Music")),
+                Some(&playing),
+            );
+
+            assert_eq!(identity_only.snapshot.is_playing, Some(true));
+            assert_eq!(
+                identity_only.snapshot.bundle_id.as_deref(),
+                Some("com.apple.Music")
+            );
+            assert_eq!(identity_only.snapshot.title, None);
+            assert_eq!(identity_only.snapshot.artist, None);
+            assert_eq!(identity_only.snapshot.album, None);
+            assert!(identity_only.artwork.is_none());
+            assert!(identity_only.snapshot.artwork.is_none());
+            assert_eq!(identity_only.snapshot.artwork_signature, None);
+            assert_ne!(
+                identity_only.snapshot.track_key(),
+                playing.snapshot.track_key()
+            );
         }
 
         #[test]
@@ -985,6 +1036,20 @@ mod tests {
             select_playback_candidate(&candidates).map(|value| value.stable_id.as_str()),
             Some("music")
         );
+    }
+
+    #[test]
+    fn metadata_less_playing_candidate_remains_selectable() {
+        let mut metadata_less = candidate("music", true, Some(200.0), false);
+        metadata_less.bundle_id = Some("com.apple.Music".into());
+        let candidates = [candidate("spotify", true, Some(100.0), true), metadata_less];
+
+        let selected = select_playback_candidate(&candidates).expect("active candidate selected");
+
+        assert_eq!(selected.stable_id, "music");
+        assert_eq!(selected.bundle_id.as_deref(), Some("com.apple.Music"));
+        assert_eq!(selected.title, None);
+        assert_eq!(selected.artwork_data, None);
     }
 
     #[test]

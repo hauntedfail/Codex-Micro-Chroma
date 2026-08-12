@@ -91,34 +91,23 @@ static void copyNumber(NSMutableDictionary *destination, NSString *outputKey,
     }
 }
 
-static NSArray *publicCandidatesIfComplete(NSArray *candidates, BOOL *complete) {
+static NSArray *publicCandidates(NSArray *candidates) {
     NSMutableArray *publicCandidates =
         [NSMutableArray arrayWithCapacity:candidates.count];
-    BOOL valid = YES;
 
     for (NSDictionary *candidate in candidates) {
         if (![candidate isKindOfClass:[NSDictionary class]]) {
-            valid = NO;
             continue;
-        }
-
-        BOOL playing = [candidate[@"playing"] boolValue];
-        if (playing) {
-            if (![candidate[@"metadataResolved"] boolValue]) {
-                valid = NO;
-            }
         }
 
         NSMutableDictionary *publicCandidate = [candidate mutableCopy];
         if ([candidate[@"lastPlayingDateError"] boolValue]) {
             [publicCandidate removeObjectForKey:@"lastPlayingDate"];
         }
-        [publicCandidate removeObjectForKey:@"metadataResolved"];
         [publicCandidate removeObjectForKey:@"lastPlayingDateError"];
         [publicCandidates addObject:publicCandidate];
     }
 
-    *complete = valid;
     return publicCandidates;
 }
 
@@ -165,13 +154,8 @@ static void refreshSessions(void) {
       }
       completed = YES;
       if (!timedOut) {
-          BOOL candidatesComplete = NO;
-          NSArray *publicCandidates =
-              publicCandidatesIfComplete(candidates, &candidatesComplete);
-          if (candidatesComplete) {
-              printCandidates(publicCandidates);
-              pruneArtworkCache(activeStableIDs);
-          }
+          printCandidates(publicCandidates(candidates));
+          pruneArtworkCache(activeStableIDs);
       }
       refreshInFlight = NO;
       scheduleRefresh();
@@ -237,7 +221,6 @@ static void refreshSessions(void) {
                     @"bundleId" : bundleID,
                     @"playing" : @NO,
                     @"playingResolved" : @NO,
-                    @"metadataResolved" : @NO,
                     @"lastPlayingDateError" : @NO,
                     @"elected" : @([playerPath isEqual:electedPath]),
                 } mutableCopy];
@@ -260,7 +243,6 @@ static void refreshSessions(void) {
                       return;
                   }
                   if ([information isKindOfClass:[NSDictionary class]]) {
-                      entry[@"metadataResolved"] = @YES;
                       copyString(entry, @"title", information,
                                  @"kMRMediaRemoteNowPlayingInfoTitle");
                       copyString(entry, @"artist", information,
