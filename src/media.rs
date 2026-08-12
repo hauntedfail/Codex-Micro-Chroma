@@ -238,29 +238,72 @@ mod platform {
     enum HelperControlMessage {
         Ready,
         Reset { reason: Option<String> },
-        Invalid(String),
+        Invalid,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum HelperControlKind {
+        Ready,
+        Reset,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReadyControlMessage {
+        ready: bool,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ResetControlMessage {
+        reset: Option<String>,
+    }
+
+    fn control_kind_prefix(line: &str) -> Option<HelperControlKind> {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(r#"{"ready""#) {
+            Some(HelperControlKind::Ready)
+        } else if trimmed.starts_with(r#"{"reset""#) {
+            Some(HelperControlKind::Reset)
+        } else {
+            None
+        }
+    }
+
+    fn is_control_shaped(line: &str) -> bool {
+        control_kind_prefix(line).is_some()
     }
 
     fn parse_helper_control_line(line: &str) -> HelperControlMessage {
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(serde_json::Value::Object(map))
-                if map
-                    .get("ready")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false) =>
-            {
-                HelperControlMessage::Ready
-            }
-            Ok(serde_json::Value::Object(map)) if map.contains_key("reset") => {
-                HelperControlMessage::Reset {
-                    reason: map
-                        .get("reset")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned),
+        if !is_control_shaped(line) {
+            return HelperControlMessage::Invalid;
+        }
+        match control_kind_prefix(line) {
+            Some(HelperControlKind::Ready) => {
+                match serde_json::from_str::<ReadyControlMessage>(line) {
+                    Ok(message) if message.ready => HelperControlMessage::Ready,
+                    _ => HelperControlMessage::Invalid,
                 }
             }
-            _ => HelperControlMessage::Invalid(line.to_owned()),
+            Some(HelperControlKind::Reset) => {
+                match serde_json::from_str::<ResetControlMessage>(line) {
+                    Ok(message) => HelperControlMessage::Reset {
+                        reason: message.reset,
+                    },
+                    _ => HelperControlMessage::Invalid,
+                }
+            }
+            None => HelperControlMessage::Invalid,
         }
+    }
+
+    fn system_time_from_unix_seconds(seconds: f64) -> Option<SystemTime> {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return None;
+        }
+        Duration::try_from_secs_f64(seconds)
+            .ok()
+            .and_then(|duration| UNIX_EPOCH.checked_add(duration))
     }
 
     #[derive(Clone)]
@@ -332,8 +375,7 @@ mod platform {
             });
             let info_update_time = candidate
                 .info_update_date
-                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-                .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs_f64(seconds)));
+                .and_then(system_time_from_unix_seconds);
             let update_age_seconds = info_update_time.and_then(|updated_at| {
                 SystemTime::now()
                     .duration_since(updated_at)
@@ -487,7 +529,7 @@ mod platform {
                 let _ = publish_stopped(state, reason, StoppedDelivery::OneShotReset);
                 return;
             }
-            HelperControlMessage::Invalid(_) => {}
+            HelperControlMessage::Invalid => {}
         }
         let payload = match serde_json::from_str::<SessionPayload>(line) {
             Ok(payload) => payload,
@@ -673,7 +715,7 @@ mod platform {
                             )));
                             return;
                         }
-                        HelperControlMessage::Invalid(line) => {
+                        HelperControlMessage::Invalid => {
                             let _ = ready_tx.send(Err(format!(
                                 "malformed pre-ready output from MediaRemote session helper: {line}"
                             )));
@@ -967,6 +1009,15 @@ mod platform {
         }
 
         #[test]
+        fn huge_finite_media_remote_timestamp_degrades_to_payload_elapsed_time() {
+            let received =
+                ReceivedNowPlaying::from_candidate(Some(&candidate("Song", 42.0, f64::MAX)), None);
+
+            assert_eq!(received.snapshot.elapsed_time, Some(42.0));
+            assert_eq!(received.position_at_received, Some(42.0));
+        }
+
+        #[test]
         fn helper_control_line_accepts_ready_message() {
             assert_eq!(
                 parse_helper_control_line(r#"{"ready":true}"#),
@@ -988,7 +1039,7 @@ mod platform {
         fn helper_control_line_rejects_session_payload_before_ready() {
             assert_eq!(
                 parse_helper_control_line(r#"{"candidates":[]}"#),
-                HelperControlMessage::Invalid(r#"{"candidates":[]}"#.to_owned())
+                HelperControlMessage::Invalid
             );
         }
 
@@ -996,7 +1047,54 @@ mod platform {
         fn helper_control_line_rejects_malformed_before_ready() {
             assert_eq!(
                 parse_helper_control_line("not json"),
-                HelperControlMessage::Invalid("not json".to_owned())
+                HelperControlMessage::Invalid
+            );
+        }
+
+        #[test]
+        fn session_payload_is_not_control_shaped_before_payload_parse() {
+            let state = RwLock::new(NowPlayingState::default());
+            let mut reported_parse_error = false;
+            let payload = r#"{"candidates":[{"stableId":"music","bundleId":"com.apple.Music","playing":true,"playingResolved":true,"lastPlayingDate":500.0,"elected":true,"title":"New Song"}]}"#;
+
+            assert_eq!(control_kind_prefix(payload), None);
+            assert!(!is_control_shaped(payload));
+            process_started_helper_line(&state, &mut reported_parse_error, payload);
+
+            assert!(!reported_parse_error);
+            let state = state.read().expect("state lock is readable");
+            let snapshot = &state
+                .latest
+                .as_ref()
+                .expect("payload is published")
+                .snapshot;
+            assert_eq!(snapshot.title.as_deref(), Some("New Song"));
+        }
+
+        #[test]
+        fn malformed_post_ready_payloads_report_only_first_error() {
+            let state = RwLock::new(NowPlayingState::default());
+            let mut reported_parse_error = false;
+
+            process_started_helper_line(&state, &mut reported_parse_error, "not json");
+            assert!(reported_parse_error);
+            process_started_helper_line(&state, &mut reported_parse_error, "{still bad");
+            assert!(reported_parse_error);
+            process_started_helper_line(
+                &state,
+                &mut reported_parse_error,
+                r#"{"candidates":[{"stableId":"music","playing":true,"playingResolved":true}]}"#,
+            );
+
+            let state = state.read().expect("state lock is readable");
+            assert_eq!(
+                state
+                    .latest
+                    .as_ref()
+                    .expect("valid payload still publishes")
+                    .snapshot
+                    .is_playing,
+                Some(true)
             );
         }
 

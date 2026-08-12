@@ -346,6 +346,7 @@ static NSComparisonResult compareCandidateRank(NSDictionary *left,
     return [leftStableID compare:rightStableID];
 }
 
+#if defined(MEDIA_SESSIONS_SMOKE)
 static NSArray *rankedPlayingCandidates(NSArray *candidates, NSUInteger limit) {
     NSMutableArray *playingCandidates = [NSMutableArray array];
     for (NSDictionary *candidate in candidates) {
@@ -366,6 +367,7 @@ static NSArray *rankedPlayingCandidates(NSArray *candidates, NSUInteger limit) {
     }
     return playingCandidates;
 }
+#endif
 
 static NSComparisonResult compareRecordRank(NSDictionary *left,
                                             NSDictionary *right) {
@@ -401,6 +403,15 @@ static NSArray *candidateEntriesFromRecords(NSArray *records) {
         }
     }
     return entries;
+}
+
+static NSUInteger nextWatchdogToken(NSUInteger token) {
+    return token == NSUIntegerMax ? 1 : token + 1;
+}
+
+static BOOL watchdogTokenIsCurrent(NSUInteger armedToken,
+                                   NSUInteger currentToken) {
+    return armedToken != 0 && armedToken == currentToken;
 }
 
 static void printCandidates(NSArray *candidates) {
@@ -452,12 +463,28 @@ static void refreshSessions(void) {
     Class requestClass = NSClassFromString(@"MRNowPlayingRequest");
     id electedPath = objectProperty(requestClass, @"localNowPlayingPlayerPath");
     __block BOOL completed = NO;
+    __block NSUInteger watchdogToken = 0;
+    __block void (^complete)(BOOL) = nil;
 
-    void (^complete)(BOOL) = ^(BOOL timedOut) {
+    void (^armWatchdog)(void) = ^{
+      watchdogToken = nextWatchdogToken(watchdogToken);
+      NSUInteger armedToken = watchdogToken;
+      dispatch_after(
+          dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
+          queue, ^{
+            if (!completed &&
+                watchdogTokenIsCurrent(armedToken, watchdogToken)) {
+                complete(YES);
+            }
+          });
+    };
+
+    complete = ^(BOOL timedOut) {
       if (completed) {
           return;
       }
       completed = YES;
+      watchdogToken = nextWatchdogToken(watchdogToken);
       if (timedOut) {
           restartAfterTimeout();
       } else {
@@ -477,12 +504,7 @@ static void refreshSessions(void) {
       scheduleRefresh();
     };
 
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
-        queue, ^{
-          complete(YES);
-        });
-
+    armWatchdog();
     getNowPlayingClients(queue, ^(id clientsValue) {
         if (completed) {
             return;
@@ -498,6 +520,7 @@ static void refreshSessions(void) {
               complete(NO);
               return;
           }
+          armWatchdog();
           dispatch_group_t enrichmentGroup = dispatch_group_create();
           for (NSDictionary *record in [topRecords copy]) {
               NSMutableDictionary *entry = record[@"entry"];
@@ -533,6 +556,7 @@ static void refreshSessions(void) {
               return;
           }
 
+          armWatchdog();
           NSUInteger endIndex =
               MIN(clients.count, startIndex + MAX_PHASE1_BATCH_CLIENTS);
           dispatch_group_t batchGroup = dispatch_group_create();
@@ -722,6 +746,16 @@ static NSDictionary *smokeRecord(NSMutableDictionary *entry) {
 static int runSmokeTests(void) {
     artworkCache = [NSMutableDictionary dictionary];
     artworkCacheBytes = 0;
+
+    if (nextWatchdogToken(0) != 1 ||
+        nextWatchdogToken(41) != 42 ||
+        nextWatchdogToken(NSUIntegerMax) != 1 ||
+        !watchdogTokenIsCurrent(7, 7) ||
+        watchdogTokenIsCurrent(0, 0) ||
+        watchdogTokenIsCurrent(7, 8)) {
+        fprintf(stderr, "watchdog token guard failed\n");
+        return 1;
+    }
 
     NSMutableString *longText = [NSMutableString string];
     for (NSUInteger i = 0; i < MAX_TEXT_FIELD_BYTES + 16; i++) {
