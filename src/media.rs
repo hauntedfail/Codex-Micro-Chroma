@@ -939,12 +939,39 @@ mod tests {
     fn unresolved_scoped_playback_state_does_not_revive_a_stale_playback_rate() {
         let mut stale = candidate("music", true, Some(200.0), true);
         stale.playing_resolved = false;
+        stale.playback_rate = Some(1.0);
         let candidates = [candidate("spotify", true, Some(100.0), false), stale];
 
         assert_eq!(
             select_playback_candidate(&candidates).map(|value| value.stable_id.as_str()),
             Some("spotify")
         );
+    }
+
+    #[test]
+    fn unresolved_scoped_playback_state_does_not_prevent_stop_fallback() {
+        let mut unresolved_newer = candidate("music", true, Some(300.0), true);
+        unresolved_newer.playing_resolved = false;
+        unresolved_newer.playback_rate = Some(1.0);
+        let candidates = [
+            candidate("spotify", true, Some(100.0), false),
+            unresolved_newer,
+        ];
+
+        assert_eq!(
+            select_playback_candidate(&candidates).map(|value| value.stable_id.as_str()),
+            Some("spotify")
+        );
+    }
+
+    #[test]
+    fn unresolved_scoped_playback_state_can_turn_selection_off() {
+        let mut unresolved = candidate("music", true, Some(300.0), true);
+        unresolved.playing_resolved = false;
+        unresolved.playback_rate = Some(1.0);
+        let candidates = [candidate("spotify", false, Some(100.0), false), unresolved];
+
+        assert!(select_playback_candidate(&candidates).is_none());
     }
 
     #[test]

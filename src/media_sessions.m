@@ -158,14 +158,13 @@ static void refreshSessions(void) {
     Class requestClass = NSClassFromString(@"MRNowPlayingRequest");
     id electedPath = objectProperty(requestClass, @"localNowPlayingPlayerPath");
     __block BOOL completed = NO;
-    __block BOOL refreshValid = YES;
 
     void (^complete)(BOOL) = ^(BOOL timedOut) {
       if (completed) {
           return;
       }
       completed = YES;
-      if (!timedOut && refreshValid) {
+      if (!timedOut) {
           BOOL candidatesComplete = NO;
           NSArray *publicCandidates =
               publicCandidatesIfComplete(candidates, &candidatesComplete);
@@ -311,9 +310,7 @@ static void refreshSessions(void) {
                                     dispatch_group_leave(group);
                                     return;
                                 }
-                                if (error) {
-                                    refreshValid = NO;
-                                } else {
+                                if (!error) {
                                     entry[@"playing"] = @(playing);
                                     entry[@"playingResolved"] = @YES;
                                 }
