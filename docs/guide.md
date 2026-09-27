@@ -273,7 +273,7 @@ cargo test --all-targets --all-features
 
 The `Release macOS binary` GitHub Actions workflow builds an ad-hoc-signed universal binary, creates a checksum, and publishes both files in a new GitHub Release. The requested version must match the `version` in `Cargo.toml`.
 
-To publish manually, open **Actions > Release macOS binary > Run workflow** and enter a version without the leading `v`, such as `0.1.0`. Alternatively, push a matching tag such as `v0.1.0`.
+To publish manually, open **Actions > Release macOS binary > Run workflow** and enter a version without the leading `v`, such as `0.2.0`. Alternatively, push a matching tag such as `v0.2.0`.
 
 An existing release or manually supplied existing tag is never overwritten. Update `Cargo.toml` before publishing the next version. Once the release is available, update the download version in both [the README](../README.md#get-started) and this guide.
 
