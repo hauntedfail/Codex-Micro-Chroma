@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="480" viewBox="0 0 1200 480" role="img" aria-labelledby="title desc">
+  <title id="title">Artwork becomes colour. Audio becomes motion.</title>
+  <desc id="desc">An abstract orange and violet artwork flows through a waveform into a glowing ring. Concept illustration of Codex Micro Chroma, not a hardware recording.</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#101222"/><stop offset="1" stop-color="#080a12"/></linearGradient>
+    <linearGradient id="art" x2=".9" y2="1"><stop stop-color="#ffc078"/><stop offset=".42" stop-color="#f1785d"/><stop offset="1" stop-color="#7069f5"/></linearGradient>
+    <linearGradient id="signal"><stop stop-color="#f8ab7c"/><stop offset="1" stop-color="#a097ff"/></linearGradient>
+    <radialGradient id="halo"><stop stop-color="#f99468" stop-opacity=".2"/><stop offset="1" stop-color="#f99468" stop-opacity="0"/></radialGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="12"/></filter>
+    <clipPath id="cover"><rect x="88" y="135" width="208" height="208" rx="16"/></clipPath>
+  </defs>
+  <rect width="1200" height="480" rx="24" fill="url(#bg)"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <text x="64" y="62" fill="#c3c7db" font-size="15" letter-spacing="3">CODEX MICRO CHROMA</text>
+    <text x="1136" y="62" text-anchor="end" fill="#a7acc6" font-size="14" letter-spacing="2">ARTWORK × AUDIO</text>
+    <g clip-path="url(#cover)">
+      <rect x="88" y="135" width="208" height="208" fill="url(#art)"/>
+      <circle cx="253" cy="171" r="100" fill="#ffddb0" opacity=".65"/>
+      <path d="M60 326 Q170 140 330 306 V380 H60Z" fill="#342d68" opacity=".7"/>
+      <path d="M66 355 Q180 212 325 332 V380 H66Z" fill="#171b36" opacity=".8"/>
+    </g>
+    <rect x="88" y="135" width="208" height="208" rx="16" fill="none" stroke="#ffffff" stroke-opacity=".15"/>
+    <path d="M324 239 H389 M683 239 H758" fill="none" stroke="#555972" stroke-width="2"/>
+    <path d="m382 234 7 5-7 5 M751 234 l7 5-7 5" fill="none" stroke="#959ab5" stroke-width="2"/>
+    <g stroke="url(#signal)" stroke-width="7" stroke-linecap="round">
+      <path d="M421 229v20 M440 214v50 M459 201v76 M478 219v40 M497 187v104 M516 164v150 M535 201v76 M554 217v44 M573 182v114 M592 205v68 M611 221v36 M630 212v54 M649 231v16"/>
+    </g>
+    <circle cx="925" cy="239" r="190" fill="url(#halo)"/>
+    <circle cx="925" cy="239" r="105" fill="none" stroke="#f9a275" stroke-width="18" opacity=".7" filter="url(#glow)"/>
+    <circle cx="925" cy="239" r="105" fill="#10121c" stroke="url(#art)" stroke-width="7"/>
+    <circle cx="925" cy="239" r="85" fill="none" stroke="#242738"/>
+    <text x="925" y="235" text-anchor="middle" fill="#ffe1c6" font-size="16" letter-spacing="3">COLOUR</text>
+    <text x="925" y="260" text-anchor="middle" fill="#bab5e5" font-size="16" letter-spacing="3">IN MOTION</text>
+    <g fill="#ececf6" font-size="19" text-anchor="middle">
+      <text x="192" y="395">Pick up the colour.</text>
+      <text x="535" y="395">Follow the sound.</text>
+      <text x="925" y="395">Light up your desk.</text>
+    </g>
+    <text x="600" y="446" text-anchor="middle" fill="#9ca2bb" font-size="13" letter-spacing="1">CONCEPT ILLUSTRATION · NOT A HARDWARE RECORDING</text>
+  </g>
+</svg>
